@@ -22,6 +22,9 @@ export XCURSOR_PATH=/root/.nix-profile/share/icons
 export XCURSOR_THEME=Adwaita
 export XCURSOR_SIZE=$(cat $markdir/curSize 2>/dev/null)
 
+# get ALSA to work with CRAS
+export LD_LIBRARY_PATH=/usr/local/cras-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
 # mesa setup
 MESA=$(nix-build '<nixpkgs>' -A mesa --no-out-link | tail -n 1)
 export __EGL_VENDOR_LIBRARY_FILENAMES=$MESA/share/glvnd/egl_vendor.d/50_mesa.json

@@ -35,6 +35,9 @@ basic(){
   mix install mesa adwaita-icon-theme gcc # mesa for drivers, icon for icons, gcc to compile the shim
   gcc -O2 -shared -fPIC -o /lib/wlshim.so /lib/wlshim.c # I wrote a shim to translate certain v4 wayland protocols to their v3 counterpart and spoof exo as v4 so clients requiring v4 don't break
   echo "30" > $markDir/curSize
+  mkdir -p /usr/local/cras-lib
+  ln -sf /usr/lib64/libcras.so /usr/local/cras-lib/libcras.so
+  ln -sf /usr/lib64/libcras.so /usr/local/cras-lib/libcras.so.0
   touch $basicMark
   echo -e "${G}Done!${N}"
   sleep 3

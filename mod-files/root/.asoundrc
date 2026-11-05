@@ -1,0 +1,6 @@
+pcm_type.cras {
+    lib "/usr/lib64/alsa-lib/libasound_module_pcm_cras.so"
+}
+ctl_type.cras {
+    lib "/usr/lib64/alsa-lib/libasound_module_ctl_cras.so"
+}
