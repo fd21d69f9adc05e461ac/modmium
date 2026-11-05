@@ -49,6 +49,7 @@ case "$1" in
     fi
     ;;
   list)
+    which less || mix install less &>/dev/null
     nix-env -q
     ;;
   revert)
