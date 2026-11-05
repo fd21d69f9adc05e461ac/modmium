@@ -69,13 +69,17 @@ menu_reset(){
   else
     basicText="Linux-native GUI"
   fi
-  if [[ -f $wineMark && -f $basicMark ]]; then
+  if [[ -f $wineMark ]]; then
     wineText="Wine GUI support ${G}(Installed)${N}"
-  else if [[ -f $basicMark ]]; then
+  else
     wineText="Wine GUI support"
   fi
-  options=("$basicText" "$wineText" "Set cursor size")
-  functions=("basic" "wine" "cursor")
+  if [[ -f $basicMark ]]; then
+    options=("$basicText" "$wineText" "Set cursor size")
+    functions=("basic" "wine" "cursor")
+  else
+    options=("$basicText" "Set cursor size")
+    functions=("basic" "cursor")
   num_options=${#options[@]}
   menuText=$(cat <<EOF
 This is a setup wizard to enable running GUI applications installed via Nix.
