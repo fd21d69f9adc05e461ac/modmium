@@ -1,0 +1,99 @@
+#!/bin/bash
+# written by fd21d69f9adc05e461ac
+
+# -- Pre TUI init --
+stty -echo
+source /usr/lib/libmosh.sh
+if [[ -d /usr/local/nix/store ]]; then
+  if ! mountpoint -q /nix; then
+    mkdir -p /nix
+    mount --bind /usr/local/nix /nix
+  fi
+  source /nix/var/nix/profiles/default/etc/profile.d/nix.sh
+  unset LD_LIBRARY_PATH
+fi
+
+# -- MAIN SCRIPT --
+tput civis # :whale:
+
+# wine setup
+export WINEPREFIX=${WINEPREFIX:-/usr/local/wine64}
+export WINEARCH=win64
+
+# markers
+markdir=/usr/local/.markers
+basicMark=$markdir/gui
+wineMark=$markdir/wineGui
+curSize=$(cat $markdir/curSize 2>/dev/null)
+[[ -n $curSize ]] || curSize=30
+
+basic(){
+  [[ -f $basicMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; return)
+  cp /usr/bin/.wl /usr/bin/wl
+  source /usr/bin/wl
+  echo -e "${B}Installing drivers...${N}"
+  mix install mesa adwaita-theme-icon gcc # mesa for drivers, icon for icons, gcc to compile the shim
+  gcc -O2 -shared -fPIC -o /lib/wlshim.so /lib/wlshim.c # I wrote a shim to translate certain v4 wayland protocols to their v3 counterpart and spoof exo as v4 so clients requiring v4 don't break
+  echo "30" > $markDir/curSize
+  touch $basicMark
+  echo -e "${G}Done!${N}"
+  sleep 3
+}
+wine(){
+  [[ -f $wineMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; return)
+  basic
+  echo -e "${B}Installing wine, dxvk...${N}"
+  mix install wineWow64Packages.full dxvk # wine, dxvk setup script
+  rm -rf $WINEPREFIX # in case user is reinstalling to repair a broken install
+  wl wineboot -u # initialize wineprefix
+  DXVK=$(nix-build '<nixpkgs>' -A dxvk --no-out-link | tail -n 1)
+  wl $DXVK/bin/setup_dxvk.sh install -p $WINEPREFIX #install dxvk dll's
+  touch $wineMark
+  echo -e "${G}Done!${N}"
+  sleep 3
+}
+cursor(){
+  stty echo
+  echo -e "${P}Current cursor size: ${curSize}${N}"
+  echo -e "${B}Enter integer cursor size (default 30): ${N}"
+  read -re newSize
+  [[ newSize =~ ^[0-9]+$ ]] || (echo -e "${R}Invalid input.${N}"; sleep 3)
+  echo $newSize > $markdir/CurSize
+  echo -e "${G}Done!${N}"
+}
+
+menu_reset(){
+  if [[ -f $basicMark ]]; then
+    basicText="Linux-native GUI ${G}(Installed)${N}"
+  else
+    basicText="Linux-native GUI"
+  fi
+  if [[ -f $wineMark ]]; then
+    wineText="Wine GUI support ${G}(Installed)${N}"
+  else
+    wineText="Wine GUI support"
+  fi
+  options=("$basicText" "$wineText" "Set cursor size")
+  functions=("basic" "wine" "cursor")
+  num_options=${#options[@]}
+  menuText=$(cat <<EOF
+This is a setup wizard to enable running GUI applications installed via Nix.
+${R}CURRENTLY IN BETA, IF YOU DON'T KNOW WHAT WAYLAND OR WINE MEANS THEN DON'T USE THIS.${N}
+Installs a wrapper called \`wl\` (usage, \`wl <program>\`).
+
+If using wine, default WINEPREFIX is /usr/local/wine64, \`wl\` will use a given WINEPREFIX if specified in environment vars.
+Call applications like \`wl wine path\\to\\program.exe\`
+
+Currently, Vulkan and DirectX are able to access the integrated GPU, while OpenGL can only use ${R}${UN}software rendering.${N}${RUN}
+Fullscreen and frame-pacing (need to implement frame rate limiter) are also known issues.
+These are known issues and are being fixed.
+EOF
+  )
+  num_options=${#options[@]}
+}
+
+menu_reset
+clear
+full_menu
+tput cnorm
+selector

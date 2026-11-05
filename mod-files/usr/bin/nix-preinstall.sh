@@ -25,10 +25,14 @@ updateMix(){
   runscriptnoroot mixupd
 }
 
+installWl(){
+  runscript /usr/bin/.setup_wl.sh
+}
+
 menu_reset(){
   if [[ -f $MARKER ]]; then
-    options=("Install Nix" "Update ${G}Mix${N}" "Go Back")
-    functions=("installNix" "updateMix" "quit")
+    options=("Install Nix" "Update ${G}Mix${N}" "Setup GUI" "Go Back")
+    functions=("installNix" "updateMix" "installWl" "quit")
   else
     options=("Install Nix" "Go Back")
     functions=("installNix" "quit")
