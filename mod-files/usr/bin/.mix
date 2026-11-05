@@ -85,8 +85,12 @@ EOF
       echo "Usage: mix remove <package>"
     fi
     ;;
+  cleanup)
+    nix-env --delete-generations old
+    nix-store --gc
+    ;;
   *)
-    echo "Usage: mix {install|search|list|revert|repair|upgrade|remove|help} [args]"
+    echo "Usage: mix {install|remove|search|cleanup|list|revert|repair|upgrade|help} [args]"
     exit 1
     ;;
 esac
