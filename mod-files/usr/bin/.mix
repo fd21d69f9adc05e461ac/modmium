@@ -37,7 +37,7 @@ case "$1" in
       for p in "${@:2}"; do
         pkgs+=("nixpkgs.$p")
       done
-        nix-env -iA "${pkgs[@]}"
+      nix-env -iA "${pkgs[@]}"
     fi
     ;;
   search)
@@ -80,7 +80,9 @@ EOF
     ;;
   remove)
     if [ -n "$2" ]; then
-      nix-env -e "$2"
+      for p in "${@:2}"; do
+        nix-env -e "$p"
+      done 
       nix-collect-garbage -d
     else
       echo "Usage: mix remove <package>"
