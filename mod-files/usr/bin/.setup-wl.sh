@@ -44,10 +44,13 @@ wine(){
   [[ -f $wineMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; exit)
   echo -e "${B}Installing wine, dxvk...${N}"
   mix install wineWow64Packages.full dxvk # wine, dxvk setup script
+  WINEPREFIX=/usr/local/wine64
+  WINEARCH=win64
   rm -rf $WINEPREFIX # in case user is reinstalling to repair a broken install
   wl wineboot -u # initialize wineprefix
   DXVK=$(nix-build '<nixpkgs>' -A dxvk --no-out-link | tail -n 1)
-  wl $DXVK/bin/setup_dxvk.sh install -p $WINEPREFIX #install dxvk dll's
+  sleep 3 # evidently there is some kind of timing issue otherwise, need to give time for wineboot to actually wrap up
+  wl $DXVK/bin/setup_dxvk.sh install -p $WINEPREFIX # install dxvk dll's
   touch $wineMark
   echo -e "${G}Done!${N}"
   sleep 3
