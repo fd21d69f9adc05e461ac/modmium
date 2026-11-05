@@ -14,6 +14,7 @@ as_system() {
 selected_index=0
 branch=$(cat /.branch)
 modver=$(cat /usr/share/.version)
+markdir=/usr/local/.markers; mkdir -p $markdir
 shellfile=/root/.modshell
 shell="bash"
 [ -s "$shellfile" ] && shell=$(<"$shellfile")
@@ -202,7 +203,7 @@ full_menu() {
     display_menu "${voffset:-0}"
     if [[ "$center_menu" == "1" ]]; then
       while ! read -rsn1 -t 1 key 2>/dev/null; do
-        if [[ $resize -eq 1 ]]; then 
+        if [[ $resize -eq 1 ]]; then
           resize=0
           clear
           continue 2;

@@ -7,8 +7,8 @@ source /usr/lib/libmosh.sh
 source /etc/profile
 
 # -- policy flags --
-DEVINSTALL_FILE="/mnt/stateful_partition/.devinstall_complete"
-POLTEST_FILE="/mnt/stateful_partition/.policytesttool_setup"
+DEVINSTALL_FILE="$markdir/devinstall_complete"
+POLTEST_FILE="$markdir/policytesttool_setup"
 POLICYFILE="/root/policy.json"
 
 # -- exts to recommend forceinstall
@@ -23,8 +23,8 @@ fail(){
 }
 
 reinstall(){
-  rm -f "$DEVINSTALL_FILE" "$POLTEST_FILE"
-  echo -e "${G}Removed .devinstall_complete and .policytesttool_setup markers.${N}"
+  rm -f "$POLICYFILE"
+  echo -e "${G}Removed policy.json file.${N}"
   sleep 2
   exit
 }
@@ -32,7 +32,7 @@ reinstall(){
 install(){
   clear
   stty echo
-  if [[ -f $POLTEST_FILE ]]; then
+  if [[ -f $POLTEST_FILE && -f $POLICYFILE ]]; then
     echo -e "${G}Setup already completed. Running orchestrator...${N}"
     cd /usr/local/share/policy-test-tool
     /usr/bin/.unhang.sh &
@@ -54,7 +54,7 @@ install(){
     echo -e "${G}Installing protobuf-python...${N}"
     emerge protobuf-python || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
   fi
-  
+
   cp /etc/chrome_dev.conf /etc/.chrome_dev.conf
 
   cleanup(){
@@ -179,7 +179,8 @@ grabpol2(){
 grabpol2f(){
   echo -e "Grabbing policies..."
   if ! python /usr/share/.policy-test-tool/decode_policy.py; then
-    echo -e "${R}Unable to decode policies!${N}"
+    fail "${R}Unable to decode policies!${N}"
+  else
     sleep 3
   fi
 }

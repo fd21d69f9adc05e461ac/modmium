@@ -3,9 +3,9 @@
 
 source /root/.bashrc # to get $EDITOR
 jsonFile="/usr/local/share/policy-test-tool/dump.json"
-DEVINSTALL_FILE="/mnt/stateful_partition/.devinstall_complete"
-DEVPOL_FILE="/mnt/stateful_partition/.devpol_setup"
-PYTHON_PROTOSKID="/mnt/stateful_partition/.python_protoskid" # this just checks for the packages themselves, i was too lazy to rename it after changing that.
+DEVINSTALL_FILE="$markdir/devinstall_complete"
+DEVPOL_FILE="$markdir/devpol_setup"
+PYTHON_PROTOSKID="$markdir/python_protoskid" # this just checks for the packages themselves, i was too lazy to rename it after changing that.
 
 fail(){
   echo -e "$1"
@@ -34,7 +34,7 @@ if [[ ! -f $DEVPOL_FILE ]] || [[ ! -d /usr/local/share/policy-test-tool ]]; then
   ldconfig # emerge breaks without this too
   emerge cryptography nano pyyaml protobuf-python || fail "${R}emerge failed. Check your internet connection and try again.${N}"
   touch $PYTHON_PROTOSKID
-  
+
   cp -r /usr/share/.policy-test-tool /usr/local/share/policy-test-tool || fail "${R}Could not copy tool files from /usr/share/.policy-test-tool.${N}"
 
   # Only mark setup complete once everything above succeeded
@@ -50,7 +50,7 @@ if [[ ! -f $PYTHON_PROTOSKID ]]; then
     ldconfig
     emerge cryptography nano pyyaml protobuf-python || fail "${R}emerge failed. Check your internet connection and try again.${N}" # I was gonna make this emerge just protobuf-python, but might as well do the others too.
     touch $PYTHON_PROTOSKID
-  else 
+  else
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
     touch $DEVINSTALL_FILE
     ldconfig
@@ -84,7 +84,7 @@ RESTRICTIONS=(
   "SupervisedUsersEnabled" "DeviceAllowRedeemChromeOsRegistrationOffers"
   "DeviceRestrictedManagedGuestSessionEnabled" "DeviceCrostiniArcAdbSideloadingAllowed"
   "DeviceLoginScreenExtensionManifestV2Availability" "DeviceExtensionsSystemLogEnabled"
-  "DeviceEphemeralUsersEnabled" "DeviceDebugPacketCaptureAllowed" 
+  "DeviceEphemeralUsersEnabled" "DeviceDebugPacketCaptureAllowed"
 )
 
 REPORTING=(
