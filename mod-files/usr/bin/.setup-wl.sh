@@ -28,20 +28,20 @@ curSize=$(cat $markdir/curSize 2>/dev/null)
 [[ -n $curSize ]] || curSize=30
 
 basic(){
-  [[ -f $basicMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; return)
+  [[ -f $basicMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; exit)
   cp /usr/bin/.wl /usr/bin/wl
   source /usr/bin/wl
   echo -e "${B}Installing drivers...${N}"
-  mix install mesa adwaita-theme-icon gcc # mesa for drivers, icon for icons, gcc to compile the shim
+  mix install mesa adwaita-icon-theme gcc # mesa for drivers, icon for icons, gcc to compile the shim
   gcc -O2 -shared -fPIC -o /lib/wlshim.so /lib/wlshim.c # I wrote a shim to translate certain v4 wayland protocols to their v3 counterpart and spoof exo as v4 so clients requiring v4 don't break
   echo "30" > $markDir/curSize
   touch $basicMark
   echo -e "${G}Done!${N}"
   sleep 3
+  exit
 }
 wine(){
-  [[ -f $wineMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; return)
-  basic
+  [[ -f $wineMark ]] && (echo -e "${G}Already installed!${N}"; sleep 3; exit)
   echo -e "${B}Installing wine, dxvk...${N}"
   mix install wineWow64Packages.full dxvk # wine, dxvk setup script
   rm -rf $WINEPREFIX # in case user is reinstalling to repair a broken install
@@ -51,6 +51,7 @@ wine(){
   touch $wineMark
   echo -e "${G}Done!${N}"
   sleep 3
+  exit
 }
 cursor(){
   stty echo
@@ -68,9 +69,9 @@ menu_reset(){
   else
     basicText="Linux-native GUI"
   fi
-  if [[ -f $wineMark ]]; then
+  if [[ -f $wineMark && -f $basicMark ]]; then
     wineText="Wine GUI support ${G}(Installed)${N}"
-  else
+  else if [[ -f $basicMark ]]; then
     wineText="Wine GUI support"
   fi
   options=("$basicText" "$wineText" "Set cursor size")

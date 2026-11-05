@@ -20,7 +20,7 @@ export WINEDEBUG=fixme-all,err-waylanddrv
 # cursor setup
 export XCURSOR_PATH=/root/.nix-profile/share/icons
 export XCURSOR_THEME=Adwaita
-export XCURSOR_SIZE=$(cat $markdir/curSize)
+export XCURSOR_SIZE=$(cat $markdir/curSize 2>/dev/null)
 
 # mesa setup
 MESA=$(nix-build '<nixpkgs>' -A mesa --no-out-link | tail -n 1)
@@ -30,6 +30,7 @@ export VK_DRIVER_FILES=$MESA/share/vulkan/icd.d/intel_icd.x86_64.json
 # wine setup
 export WINEPREFIX=${WINEPREFIX:-/usr/local/wine64}
 export WINEARCH=win64
+export DXVK_CONFIG="dxvk.maxFrameRate = 60"
 
 # shim v4 wayland calls to v3
 export LD_PRELOAD="/lib/wlshim.so"

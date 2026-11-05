@@ -26,7 +26,7 @@ updateMix(){
 }
 
 installWl(){
-  runscript /usr/bin/.setup_wl.sh
+  runscript /usr/bin/.setup-wl.sh
 }
 
 menu_reset(){

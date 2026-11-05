@@ -110,7 +110,7 @@ static void global_wrap(void *data, struct wl_proxy *reg, uint32_t name, const c
     c->orig_global(c->orig_data, reg, name, iface, version);
 }
 
-int wl_proxy_add_listtener(struct wl_proxy *proxy, void (**impl)(void), void *data) {
+int wl_proxy_add_listener(struct wl_proxy *proxy, void (**impl)(void), void *data) {
   resolve();
   const char *cls = real_class ? real_class(proxy) : NULL;
   if (cls && !strcmp(cls, "wl_registry") && impl) {
