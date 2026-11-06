@@ -89,6 +89,7 @@ menu_reset(){
   fi
   num_options=${#options[@]}
   menuText=$(cat <<EOF
+
 This is a setup wizard to enable running GUI applications installed via Nix.
 ${R}CURRENTLY IN BETA, IF YOU DON'T KNOW WHAT WAYLAND OR WINE MEANS THEN DON'T USE THIS.${N}
 Installs a wrapper called \`wl\` (usage, \`wl <program>\`).
@@ -96,9 +97,6 @@ Installs a wrapper called \`wl\` (usage, \`wl <program>\`).
 If using wine, default WINEPREFIX is /usr/local/wine64, \`wl\` will use a given WINEPREFIX if specified in environment vars.
 Call applications like \`wl wine path\\to\\program.exe\`
 
-Currently, Vulkan and DirectX are able to access the integrated GPU, while OpenGL can only use ${R}${UN}software rendering.${N}${RUN}
-Fullscreen and frame-pacing (need to implement frame rate limiter) are also known issues.
-These are known issues and are being fixed.
 EOF
   )
   num_options=${#options[@]}
