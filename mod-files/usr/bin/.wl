@@ -15,27 +15,31 @@ markdir=/usr/local/.markers
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
 export WAYLAND_DISPLAY=/run/chrome/wayland-0
-export WINEDEBUG=fixme-all,err-waylanddrv
+export WINEDEBUG=${WINEDEBUG:-fixme-all,err-waylanddrv}
 
 # cursor setup
 export XCURSOR_PATH=/root/.nix-profile/share/icons
 export XCURSOR_THEME=Adwaita
 export XCURSOR_SIZE=$(cat $markdir/curSize 2>/dev/null)
 
-# get ALSA to work with CRAS
-export LD_LIBRARY_PATH=/usr/local/cras-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-
 # mesa setup
 MESA=$(nix-build '<nixpkgs>' -A mesa --no-out-link | tail -n 1)
 export __EGL_VENDOR_LIBRARY_FILENAMES=$MESA/share/glvnd/egl_vendor.d/50_mesa.json
 export VK_DRIVER_FILES=$MESA/share/vulkan/icd.d/intel_icd.x86_64.json
+export GALLIUM_DRIVER=${GALLIUM_DRIVER:-zink}
 
 # wine setup
 export WINEPREFIX=${WINEPREFIX:-/usr/local/wine64}
 export WINEARCH=win64
-export DXVK_CONFIG="dxvk.maxFrameRate = 60"
+export DXVK_LOG_LEVEL=warn
 
 # shim v4 wayland calls to v3
 export LD_PRELOAD="/lib/wlshim.so"
+export WLSHIM_FAKE=${WLSHIM_FAKE:-wl_compositor=4,zwp_linux_dmabuf_v1=4}
+export WLSHIM_FPS=${WLSHIM_FPS:-60}
+case "$(basename "$1")" in wine|wine64) export WLSHIM_LOGICAL_MODE=${WLSHIM_LOGICAL_MODE:-1};; esac
+
+# get ALSA to work with CRAS
+export LD_LIBRARY_PATH=/usr/local/cras-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 exec "$@"
