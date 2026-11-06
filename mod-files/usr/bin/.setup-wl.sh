@@ -95,7 +95,7 @@ ${R}CURRENTLY IN BETA, IF YOU DON'T KNOW WHAT WAYLAND OR WINE MEANS THEN DON'T U
 Installs a wrapper called \`wl\` (usage, \`wl <program>\`).
 
 If using wine, default WINEPREFIX is /usr/local/wine64, \`wl\` will use a given WINEPREFIX if specified in environment vars.
-Call applications like \`wl wine path\\to\\program.exe\`
+Call applications like \`wl wine path_to\\program.exe\`
 
 EOF
   )
