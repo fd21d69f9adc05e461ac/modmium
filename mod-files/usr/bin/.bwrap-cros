@@ -1,0 +1,139 @@
+#!/bin/bash
+# bwrap-cros - minimal bubblewrap replacement for ChromeOS (run as root).
+#
+# "Chromium OS LSM" rejects the mounts bwrap makes ("Mount path with
+# symlinks prohibited").
+# By building the same filesystem with mount without symlinks, then chrooting into
+# it, we prevent the issues caused by standard bwrap.
+#
+#   BWRAP_CROS_ROOT    where the new root is assembled (default /usr/local/.fhsroot)
+#   BWRAP_CROS_DRYRUN  print the mount/chroot commands instead of running them
+#   BWRAP_CROS_USER    uid:gid to drop to before running the command (the root is
+#                      built as root; tmpfs mounts are chowned to this user, as
+#                      bwrap would when started by that user)
+#   BWRAP_CROS_GROUPS  comma-separated numeric supplementary groups for that user
+#   BWRAP_CROS_BINDS   extra read-write binds, "hostpath:rootpath,hostpath:rootpath"
+#                      (applied last; use new top-level paths, not paths under /usr)
+#   BWRAP_CROS_UTIL    directory holding util-linux tools (pivot_root, umount); give a
+#                      nix store path, since host binaries can't run after the pivot
+#
+# The new root becomes the real root of the mount namespace (pivot_root), not just
+# a chroot: the kernel refuses to create user namespaces from inside a chroot, and
+# Steam's container runtime (pressure-vessel / bwrap) needs them.
+set -euo pipefail
+die() { echo "bwrap-cros: $*" >&2; exit 1; }
+ROOT=${BWRAP_CROS_ROOT:-/usr/local/.fhsroot}
+DRY=${BWRAP_CROS_DRYRUN:-}
+USERSPEC=${BWRAP_CROS_USER:-1000:1000}
+SUPP=${BWRAP_CROS_GROUPS:-}
+run() { if [ -n "$DRY" ]; then echo "+ $*"; else "$@"; fi; }
+
+# private mount namespace: every mount below disappears when the last process exits
+if [ -z "${BWRAP_CROS_INNER:-}" ] && [ -z "$DRY" ]; then
+  [ "$(id -u)" = 0 ] || die "must run as root"
+  command -v unshare >/dev/null || die "unshare not found (try: nix-shell -p util-linux)"
+  BWRAP_CROS_INNER=1 exec unshare --mount --propagation private "$0" "$@"
+fi
+
+# ---- parse (same option syntax as bwrap) ----
+ops=(); CHDIR=/
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bind|--ro-bind|--dev-bind|--bind-try|--ro-bind-try|--dev-bind-try|--symlink)
+      [ $# -ge 3 ] || die "$1 needs two arguments"; ops+=("$1" "$2" "$3"); shift 3;;
+    --tmpfs|--proc|--dev|--remount-ro|--dir)
+      [ $# -ge 2 ] || die "$1 needs an argument"; ops+=("$1" "$2" ""); shift 2;;
+    --chdir) [ $# -ge 2 ] || die "--chdir needs an argument"; CHDIR=$2; shift 2;;
+    --setenv) [ $# -ge 3 ] || die "--setenv needs two arguments"; export "$2=$3"; shift 3;;
+    --unsetenv) unset "$2"; shift 2;;
+    --cap-add|--cap-drop|--hostname) shift 2;;
+    --die-with-parent|--unshare-*|--share-net|--new-session|--as-pid-1) shift;;
+    --) shift; break;;
+    --*) die "unsupported option $1";;
+    *) break;;
+  esac
+done
+[ $# -gt 0 ] || die "no command given"
+
+# ---- resolve a path inside the new root, following symlinks that live in it ----
+rp() {
+  local todo=$1 cur="" n=0 comp t
+  while [ -n "$todo" ]; do
+    todo=${todo#/}; [ -z "$todo" ] && break
+    comp=${todo%%/*}
+    if [[ $todo == */* ]]; then todo=${todo#*/}; else todo=""; fi
+    case $comp in "" | .) continue ;; ..) cur=${cur%/*}; continue ;; esac
+    if [ -L "$ROOT$cur/$comp" ]; then
+      (( ++n > 40 )) && die "too many symlinks resolving $1"
+      t=$(readlink "$ROOT$cur/$comp")
+      case $t in
+        /*) cur=""; todo="${t#/}${todo:+/$todo}" ;;
+        *)  todo="$t${todo:+/$todo}" ;;
+      esac
+    else
+      cur="$cur/$comp"
+    fi
+  done
+  printf '%s\n' "${cur:-/}"
+}
+
+bind() {  # bind <rw|ro> <src> <dest> <try>
+  local mode=$1 src=$2 dest=$3 try=$4 p
+  if [ ! -e "$src" ]; then
+    [ "$try" = 1 ] && return 0
+    die "can't find source path $src"
+  fi
+  src=$(readlink -f "$src")                       # no symlinks in the mount source either
+  p=$ROOT$(rp "$dest")
+  if [ -d "$src" ]; then mkdir -p "$p"; else mkdir -p "$(dirname "$p")"; [ -e "$p" ] || : > "$p"; fi
+  run mount --rbind "$src" "$p"
+  if [ "$mode" = ro ]; then run mount -o remount,bind,ro "$p"; fi
+}
+
+# ---- build the root ----
+mkdir -p "$ROOT"
+run mount -t tmpfs tmpfs "$ROOT"
+for ((i = 0; i < ${#ops[@]}; i += 3)); do
+  op=${ops[i]} a=${ops[i+1]} b=${ops[i+2]}
+  case $op in
+    --bind|--dev-bind)          bind rw "$a" "$b" 0 ;;
+    --bind-try|--dev-bind-try)  bind rw "$a" "$b" 1 ;;
+    --ro-bind)                  bind ro "$a" "$b" 0 ;;
+    --ro-bind-try)              bind ro "$a" "$b" 1 ;;
+    --dev)                      bind rw /dev "$a" 0 ;;
+    --tmpfs)
+      p=$ROOT$(rp "$a"); mkdir -p "$p"; run mount -t tmpfs -o mode=755 tmpfs "$p"
+      if [ -n "$USERSPEC" ]; then run chown "$USERSPEC" "$p"; fi ;;
+    --proc)   p=$ROOT$(rp "$a"); mkdir -p "$p"; run mount -t proc proc "$p" ;;
+    --dir)    mkdir -p "$ROOT$(rp "$a")" ;;
+    --symlink)
+      lp=$(rp "$(dirname "$b")"); mkdir -p "$ROOT$lp"
+      ln -sfn "$a" "$ROOT$lp/$(basename "$b")" ;;
+    --remount-ro) run mount -o remount,bind,ro "$ROOT$(rp "$a")" ;;
+  esac
+done
+
+if [ -n "${BWRAP_CROS_BINDS:-}" ]; then
+  IFS=, read -ra extra <<< "$BWRAP_CROS_BINDS"
+  for pair in "${extra[@]}"; do bind rw "${pair%%:*}" "${pair#*:}" 0; done
+fi
+
+# ---- pivot into the new root ----
+# After the pivot only builtins and tools inside the new root (or /nix) can run.
+UT=${BWRAP_CROS_UTIL:-}
+tool() { if [ -n "$UT" ] && [ -x "$UT/$1" ]; then printf '%s/%s\n' "$UT" "$1"; else printf '%s\n' "$1"; fi; }
+PIVOT=$(tool pivot_root); UMOUNT=$(tool umount)
+mkdir -p "$ROOT/.oldroot"
+cd "$ROOT"
+run "$PIVOT" . .oldroot
+cd /
+run "$UMOUNT" -l /.oldroot || true      # best effort: hides the old root
+
+if [ -n "$USERSPEC" ]; then
+  gs=()
+  if [ -n "$SUPP" ]; then gs=(--groups="$SUPP"); fi
+  # chroot to "/" is not a real chroot (it is already the namespace root); it only drops privileges
+  run exec /usr/bin/chroot --userspec="$USERSPEC" ${gs[@]+"${gs[@]}"} / /usr/bin/env -C "$CHDIR" "$@"
+else
+  run exec /usr/bin/env -C "$CHDIR" "$@"
+fi

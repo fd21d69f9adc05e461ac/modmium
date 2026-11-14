@@ -1,0 +1,319 @@
+#!/bin/bash
+# steam-wine-daemon - runs games for the "wine-cros" Steam compatibility tool.
+#
+# The tool script (inside the Steam sandbox) drops request files into a directory shared
+# with the host; this daemon, running outside the sandbox with the normal wl environment
+# (Wayland Wine, wlshim, Mesa/Vulkan), runs them with the host Wine and reports back.
+#
+#   STEAM_HOST_HOME    host path of the Steam home (appears as /steam-home in the sandbox)
+#   STEAM_WINEPREFIX   Wine prefix for games (default $STEAM_HOST_HOME/wineprefix)
+#   STEAM_WINE_DXVK    nix store path of dxvk; installed into the prefix once
+#   $STEAM_HOST_HOME/wine-env  optional KEY=VALUE lines added to every game environment
+#   STEAM_GAME_LOGICAL_MODE  WLSHIM_LOGICAL_MODE for games (default 1, 0 = off)
+#   STEAM_GAME_RUNNER  wine (default), proton or pfx for all games; per game: lines "<appid>" (proton)
+#                      or "<appid> pfx" in $HOME/proton-apps
+#   STEAM_GAME_XDISPLAY    X display for Proton games (set by steam-launch)
+#   STEAM_GAME_PROTON_LIBS extra library directories for Proton Wine (set by steam-launch)
+#   STEAM_GAME_PROTON_VK_ICD  Vulkan driver file for Proton games (default is ChromeOS own, as nix Mesa needs a newer glibc than the system one)
+#   PROTON_USE_WOW64       run 32-bit games from the 64-bit side (default 1 for Proton games here, since ChromeOS has no 32-bit libc)
+#   STEAM_GAME_PROTON_DIR  the Proton tool to use (default: Proton - Experimental)
+#   STEAM_GAME_MONO  install Wine Mono in the prefix (default 1); STEAM_GAME_MONO_VERSION (default 10.4.1)
+#   STEAM_GAME_CRAS_CLOEXEC  WLSHIM_CRAS_CLOEXEC for games (default 1, 0 = off)
+#   WINECROS_RUNDIR    request directory (default $STEAM_HOST_HOME/gamerun)
+set -u
+HOSTHOME=${STEAM_HOST_HOME:?STEAM_HOST_HOME is not set}
+RUN=${WINECROS_RUNDIR:-$HOSTHOME/gamerun}
+PREFIX=${STEAM_WINEPREFIX:-$HOSTHOME/wineprefix}
+DXVK=${STEAM_WINE_DXVK:-}
+# games see the compositor logical size as their monitor size (fullscreen fits the screen)
+LOGICAL=${STEAM_GAME_LOGICAL_MODE:-1}
+CRASCX=${STEAM_GAME_CRAS_CLOEXEC:-1}
+MONO=${STEAM_GAME_MONO:-1}
+# Steamworks (DRM, cloud saves): plain Wine has no bridge to the native Steam client, Proton's
+# Wine has (lsteamclient). Games whose Steam app id is listed in $HOSTHOME/proton-apps (one id
+# per line), or every game with STEAM_GAME_RUNNER=proton, run through the proton script of the
+# tool below instead of the host Wine.
+PROTONDIR=${STEAM_GAME_PROTON_DIR:-$HOSTHOME/.local/share/Steam/steamapps/common/Proton - Experimental}
+# runner for every game: pfx (default), proton, or wine (plain host Wine on its own prefix, with
+# STEAM_GAME_FALLBACK_WINE=1 it is also what a game gets when Proton - Experimental is missing)
+RUNNER=${STEAM_GAME_RUNNER:-pfx}
+# pfx runner: directory with the stand-in DLLs built from steamclient-redirect.c (see
+# steamclient-redirect.nix). They make the host Wine hand Valve's real steamclient(64).dll over
+# to lsteamclient, which is what a game's DRM stub needs to see
+REDIRECTDIR=${STEAM_GAME_REDIRECT_DIR:-}
+# alternative to the stand-in DLLs: bin directory of a Wine built with steamclient-trampolines
+# .patch (wine-steamclient.nix); when set, it runs the pfx games and the stand-ins are not needed
+WINEBIN=${STEAM_GAME_WINE_BIN:-}
+MONOVER=${STEAM_GAME_MONO_VERSION:-10.4.1}
+
+mkdir -p "$RUN"
+# only one daemon may answer launches: an older one that was left behind (Steam closed hard)
+# would run games with its old settings. The newest daemon asks the previous one to stop.
+ME=$RUN/daemon.me
+oldme=
+[ -r "$ME" ] && read -r oldme < "$ME"
+echo $$ > "$ME"
+if [ -n "$oldme" ] && [ "$oldme" != "$$" ]; then kill "$oldme" 2>/dev/null; fi
+rm -f "$RUN"/*.req "$RUN"/*.run "$RUN"/*.tmp "$RUN"/*.kill "$RUN"/*.done "$RUN"/*.pid "$RUN"/*.log 2>/dev/null
+rmdir "$RUN/prefix.lock" 2>/dev/null
+log() { printf '%s %s\n' "$(date +%T)" "$*" >> "$RUN/daemon.log"; }
+log "daemon started, prefix $PREFIX, dxvk ${DXVK:-none}"
+
+# the sandbox sees the Steam home as /steam-home
+tr_path() {
+  local s=$1
+  s=${s//\/steam-home\//$HOSTHOME/}
+  if [ "$s" = /steam-home ]; then s=$HOSTHOME; fi
+  printf '%s' "$s"
+}
+
+# Steam recreates the links in ~/.steam at every start with the sandbox absolute paths
+# (/steam-home/...), which do not exist out here: lsteamclient looks for its native library at
+# ~/.steam/sdk64/steamclient.so. Relative links work both inside the sandbox and out here.
+fix_steam_links() {
+  local l t
+  for l in "$HOSTHOME"/.steam/*; do
+    [ -L "$l" ] || continue
+    t=$(readlink "$l")
+    case $t in
+      /steam-home/*) ln -sfn "..${t#/steam-home}" "$l" ;;
+    esac
+  done
+}
+
+# run a command against the game prefix, as the game itself would see it
+wenv() { env -u DISPLAY HOME="$HOSTHOME" WINEPREFIX="$PREFIX" "$@"; }
+
+# create the prefix and install DXVK once; later requests wait for the first one
+prepare_prefix() {
+  local out=$1
+  while ! mkdir "$RUN/prefix.lock" 2>/dev/null; do sleep 1; done
+  if [ ! -e "$PREFIX/.wine-cros-ready" ]; then
+    echo "wine-cros: creating the Wine prefix $PREFIX (first launch only)" >> "$out"
+    # no Mono/Gecko download prompts while the prefix is created
+    (cd "$HOSTHOME" && wenv WINEDLLOVERRIDES="mscoree,mshtml=" wine wineboot -u) >> "$out" 2>&1
+    wenv wineserver -w >> "$out" 2>&1
+    touch "$PREFIX/.wine-cros-ready"
+  fi
+  if [ -n "$DXVK" ] && [ -x "$DXVK/bin/setup_dxvk.sh" ] && [ ! -e "$PREFIX/.wine-cros-dxvk" ]; then
+    echo "wine-cros: installing DXVK into the prefix" >> "$out"
+    (cd "$HOSTHOME" && wenv COLUMNS=80 LINES=24 "$DXVK/bin/setup_dxvk.sh" install -p "$PREFIX") >> "$out" 2>&1
+    wenv wineserver -w >> "$out" 2>&1
+    # DXVK registers itself as a native override for d3d11 in the prefix
+    if grep -qi '"d3d11"="native' "$PREFIX/user.reg" 2>/dev/null; then
+      echo "wine-cros: DXVK installed" >> "$out"
+      touch "$PREFIX/.wine-cros-dxvk"
+    else
+      echo "wine-cros: WARNING: DXVK does not seem to be installed (no d3d11 override in user.reg); will retry next launch" >> "$out"
+    fi
+  fi
+  # Wine Mono: many launchers and games are .NET programs (FFVII_LAUNCHER.exe, ...)
+  if [ "$MONO" = 1 ] && [ ! -e "$PREFIX/.wine-cros-mono" ]; then
+    local msi="$HOSTHOME/wine-mono.msi" url="https://dl.winehq.org/wine/wine-mono/$MONOVER/wine-mono-$MONOVER-x86.msi"
+    if [ ! -s "$msi" ]; then
+      echo "wine-cros: downloading Wine Mono $MONOVER" >> "$out"
+      if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 -o "$msi.part" "$url" >> "$out" 2>&1
+      elif command -v wget >/dev/null 2>&1; then wget -O "$msi.part" "$url" >> "$out" 2>&1
+      else echo "wine-cros: no curl or wget; put wine-mono-$MONOVER-x86.msi at $msi" >> "$out"; fi
+      [ -s "$msi.part" ] && mv "$msi.part" "$msi" || rm -f "$msi.part"
+    fi
+    if [ -s "$msi" ]; then
+      echo "wine-cros: installing Wine Mono into the prefix" >> "$out"
+      (cd "$HOSTHOME" && wenv WINEDLLOVERRIDES="mscoree=b" wine msiexec /i "$msi" /qn) >> "$out" 2>&1
+      wenv wineserver -w >> "$out" 2>&1
+      if [ -d "$PREFIX/drive_c/windows/mono" ]; then touch "$PREFIX/.wine-cros-mono"; echo "wine-cros: Wine Mono installed" >> "$out"
+      else echo "wine-cros: WARNING: Wine Mono install failed; will retry next launch" >> "$out"; fi
+    else
+      echo "wine-cros: WARNING: no Wine Mono (download failed); .NET programs will not start. Put $msi in place by hand" >> "$out"
+    fi
+  fi
+  rmdir "$RUN/prefix.lock"
+}
+
+run_request() {
+  local id=$1 f="$RUN/$1.run" out="$RUN/$1.log"
+  local cwd= key val kv rc
+  local -a args=() envargs=()
+  while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+    case $key in
+      cwd) cwd=$val ;;
+      arg) args+=("$(tr_path "$val")") ;;
+      env) kv=${val%%=*}
+           case $kv in WINEPREFIX|WINELOADER|WINESERVER|WINEDLLPATH|HOME|DISPLAY) continue ;; esac
+           envargs+=("$kv=$(tr_path "${val#*=}")") ;;
+    esac
+  done < "$f"
+  rm -f "$f"
+  cwd=$(tr_path "$cwd")
+  : > "$out"
+  if [ ${#args[@]} -eq 0 ]; then
+    echo "wine-cros: empty request" >> "$out"; echo 1 > "$RUN/$id.done"; return
+  fi
+  log "request $id: ${args[*]}"
+  # runners: wine (default), proton (Proton's own Wine, through its proton script) and pfx (the
+  # host Wine on the prefix Proton made, with Proton's Steamworks bridge). proton-apps lines:
+  # "<appid>" or "<appid> pfx"
+  local appid="" kvp use_proton=0 mode=proton pl pm
+  for kvp in "${envargs[@]}"; do case $kvp in SteamAppId=*) appid=${kvp#SteamAppId=} ;; esac; done
+  if [ "$RUNNER" = proton ] || [ "$RUNNER" = pfx ]; then use_proton=1; mode=${STEAM_GAME_PROTON_MODE:-$RUNNER}; fi
+  if [ "$RUNNER" = wine ]; then use_proton=0; fi
+  if [ -n "$appid" ]; then
+    pl=$(grep -E "^$appid([[:space:]]|\$)" "$HOSTHOME/proton-apps" 2>/dev/null | head -n 1 || true)
+    if [ -n "$pl" ]; then
+      read -r _ pm <<< "$pl"
+      if [ "$pm" = wine ]; then use_proton=0; else use_proton=1; mode=${pm:-proton}; fi
+    fi
+  fi
+  if [ "$use_proton" = 1 ] && [ ! -x "$PROTONDIR/files/bin/wine" ]; then
+    if [ -n "${STEAM_GAME_FALLBACK_WINE:-}" ]; then
+      echo "wine-cros: $PROTONDIR is not installed; using the host Wine with its own prefix" >> "$out"
+      use_proton=0
+    else
+      echo "wine-cros: this needs Proton - Experimental (its Steamworks bridge and Wine prefix), which is not installed in $PROTONDIR." >> "$out"
+      echo "wine-cros: install it in Steam (Library, Tools, Proton - Experimental), then launch the game again." >> "$out"
+      echo 1 > "$RUN/$id.done"; return
+    fi
+  fi
+  [ "$use_proton" = 1 ] || prepare_prefix "$out"
+  (
+    cd "$cwd" 2>/dev/null || cd "$HOSTHOME"
+    # extra variables from $HOSTHOME/wine-env (KEY=VALUE lines), re-read for every launch:
+    # a way to set WINEDEBUG, WLSHIM_DEBUG ... without the game Properties dialog
+    local -a extra=()
+    if [ -r "$HOSTHOME/wine-env" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case $line in ""|"#"*) ;; *=*) extra+=("$line") ;; esac
+      done < "$HOSTHOME/wine-env"
+    fi
+    log "request $id: extra env: ${extra[*]:-none}, logical mode $LOGICAL"
+    # names (not values) of what the game's Properties launch options and Steam handed over
+    log "request $id: launch env: $(for kvp in "${envargs[@]}"; do case ${kvp%%=*} in STEAM*|Steam*|LANG|LC_*) ;; *) printf '%s ' "${kvp%%=*}" ;; esac; done)"
+    # request variables first, then wine-env, then ours: our prefix and home always win
+    if [ "$use_proton" = 1 ]; then
+      log "request $id: Proton runner ($PROTONDIR), app '$appid', mode $mode"
+      fix_steam_links
+      # Steam names the per-game data directory (its path is already translated above)
+      local compat=
+      for kvp in "${envargs[@]}"; do case $kvp in STEAM_COMPAT_DATA_PATH=*) compat=${kvp#STEAM_COMPAT_DATA_PATH=} ;; esac; done
+      if [ -z "$compat" ]; then compat="$HOSTHOME/.local/share/Steam/steamapps/compatdata/${appid:-0}"; fi
+      mkdir -p "$compat"
+      # Proton's Wine has only the X11 driver here (no winewayland): use the Xwayland that
+      # steam-launch runs for the Steam window
+      local xd=()
+      if [ -n "${STEAM_GAME_XDISPLAY-}" ]; then xd=(DISPLAY="$STEAM_GAME_XDISPLAY"); else echo "wine-cros: WARNING: no X display known (start Steam with steam-launch)" >> "$out"; fi
+      if [ "$mode" = pfx ] && [ ! -r "$compat/pfx/system.reg" ]; then
+        # the prefix is made by Proton itself (it also installs Mono and the Steam files): run a
+        # trivial program through it once, then go on with the host Wine as usual
+        local mpy; mpy=$(command -v python3 || true)
+        if [ -z "$mpy" ]; then echo "wine-cros: python3 is needed to create the Proton prefix and was not found" >> "$out"; echo 1 > "$RUN/$id.done"; return; fi
+        echo "wine-cros: creating the Proton prefix in $compat/pfx (first launch of this game)" >> "$out"
+        env -u DISPLAY -u WINEPREFIX "${envargs[@]}" HOME="$HOSTHOME" "${xd[@]}" \
+            LD_LIBRARY_PATH="${STEAM_GAME_PROTON_LIBS:+$STEAM_GAME_PROTON_LIBS:}${LD_LIBRARY_PATH-}" \
+            STEAM_COMPAT_DATA_PATH="$compat" PROTON_USE_WOW64="${PROTON_USE_WOW64:-1}" \
+            WLSHIM_CRAS_CLOEXEC="$CRASCX" \
+            "$mpy" "$PROTONDIR/proton" waitforexitandrun 'c:\windows\system32\cmd.exe' /c exit >> "$out" 2>&1 || true
+        if [ ! -r "$compat/pfx/system.reg" ]; then
+          echo "wine-cros: Proton did not create the prefix in $compat/pfx; see above" >> "$out"
+          echo 1 > "$RUN/$id.done"; return
+        fi
+        fix_steam_links
+      fi
+      if [ "$mode" = pfx ]; then
+        # the host Wine (Wayland, nix glibc: Vulkan and audio work as for every other game) on the
+        # prefix Proton created. Proton's steam.exe shim and lsteamclient (the bridge to the
+        # native Steam client) are Wine components, so they are taken from Proton's tree
+        local bridge="$HOSTHOME/proton-bridge" pf="$PROTONDIR/files/lib/wine" ba bf
+        for ba in x86_64-windows i386-windows x86_64-unix; do mkdir -p "$bridge/$ba"; done
+        for bf in lsteamclient.dll steam.exe vrclient.dll vrclient_x64.dll; do
+          for ba in x86_64-windows i386-windows; do
+            if [ -e "$pf/$ba/$bf" ]; then cp -f "$pf/$ba/$bf" "$bridge/$ba/"; fi
+          done
+        done
+        for bf in lsteamclient.so vrclient.so vrclient_x64.so; do
+          if [ -e "$pf/x86_64-unix/$bf" ]; then cp -f "$pf/x86_64-unix/$bf" "$bridge/x86_64-unix/"; fi
+        done
+        # no renamed copies of lsteamclient may be left in the bridge: Valve's real
+        # steamclient(64).dll from the prefix is loaded and redirected instead (below)
+        rm -f "$bridge"/x86_64-windows/steamclient*.dll "$bridge"/i386-windows/steamclient*.dll \
+              "$bridge"/x86_64-unix/steamclient*.so
+        # the stand-ins for tier0_s(64).dll / vstdlib_s(64).dll that steamclient imports: their
+        # DllMain redirects the freshly loaded steamclient to lsteamclient
+        local pdrive="$compat/pfx/drive_c/windows" rd wbin=wine wsrv=wineserver
+        if [ -n "$WINEBIN" ] && [ -x "$WINEBIN/wine" ]; then
+          wbin="$WINEBIN/wine"; wsrv="$WINEBIN/wineserver"
+          echo "wine-cros: using the steamclient-patched Wine in $WINEBIN" >> "$out"
+        elif [ -n "$REDIRECTDIR" ] && [ -r "$REDIRECTDIR/x86_64-windows/tier0_s64.dll" ]; then
+          for rd in tier0_s64 vstdlib_s64; do cp -f "$REDIRECTDIR/x86_64-windows/$rd.dll" "$pdrive/system32/"; done
+          if [ -d "$pdrive/syswow64" ]; then
+            for rd in tier0_s vstdlib_s; do cp -f "$REDIRECTDIR/i386-windows/$rd.dll" "$pdrive/syswow64/"; done
+          fi
+        else
+          echo "wine-cros: WARNING: STEAM_GAME_REDIRECT_DIR is not set or empty: games cannot reach Steamworks" >> "$out"
+        fi
+        echo "wine-cros: running the host Wine on the Proton prefix $compat/pfx (app '$appid')" >> "$out"
+        # the Windows user is steamuser, as in Proton: that is where Steam looks for the save
+        # files it syncs (Steam Cloud), not in a profile named after the Linux user
+        env -u DISPLAY "${envargs[@]}" "${extra[@]}" HOME="$HOSTHOME" \
+            USER=steamuser LOGNAME=steamuser WINEUSERNAME=steamuser \
+            WINEPREFIX="$compat/pfx" WINEDLLPATH="$bridge" \
+            WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}dxgi,d3d11,d3d10core=n" \
+            LD_LIBRARY_PATH="${STEAM_GAME_PROTON_LIBS:+$STEAM_GAME_PROTON_LIBS:}${LD_LIBRARY_PATH-}" \
+            STEAM_COMPAT_DATA_PATH="$compat" \
+            WLSHIM_LOGICAL_MODE="$LOGICAL" \
+            WLSHIM_CRAS_CLOEXEC="$CRASCX" \
+            "$wbin" 'c:\windows\system32\steam.exe' "${args[@]}" >> "$out" 2>&1 &
+      else
+      local py; py=$(command -v python3 || true)
+      if [ -z "$py" ]; then echo "wine-cros: python3 is needed to run Proton and was not found" >> "$out"; echo 1 > "$RUN/$id.done"; return; fi
+      echo "wine-cros: running through Proton: $PROTONDIR (app '$appid', python $py)" >> "$out"
+      env -u DISPLAY -u WINEPREFIX "${envargs[@]}" "${extra[@]}" HOME="$HOSTHOME" "${xd[@]}" \
+          LD_LIBRARY_PATH="${STEAM_GAME_PROTON_LIBS:+$STEAM_GAME_PROTON_LIBS:}${LD_LIBRARY_PATH-}" \
+          STEAM_COMPAT_DATA_PATH="$compat" \
+          VK_DRIVER_FILES="${STEAM_GAME_PROTON_VK_ICD:-/usr/share/vulkan/icd.d/intel_icd.x86_64.json}" VK_ICD_FILENAMES= \
+          VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}" \
+          PROTON_USE_WOW64="${PROTON_USE_WOW64:-1}" \
+          PROTON_LOG="${PROTON_LOG:-1}" PROTON_LOG_DIR="$RUN" \
+          WLSHIM_LOGICAL_MODE="$LOGICAL" \
+          WLSHIM_CRAS_CLOEXEC="$CRASCX" \
+          "$py" "$PROTONDIR/proton" waitforexitandrun "${args[@]}" >> "$out" 2>&1 &
+      fi
+    else
+    env -u DISPLAY "${envargs[@]}" "${extra[@]}" HOME="$HOSTHOME" WINEPREFIX="$PREFIX" \
+        WLSHIM_LOGICAL_MODE="$LOGICAL" \
+        WLSHIM_CRAS_CLOEXEC="$CRASCX" \
+        wine "${args[@]}" >> "$out" 2>&1 &
+    fi
+    wpid=$!
+    echo "$wpid" > "$RUN/$id.pid"
+    wait "$wpid"; rc=$?
+    # also wait for anything the game started (launchers etc.)
+    if [ "$use_proton" != 1 ]; then wenv wineserver -w >> "$out" 2>&1
+    elif [ "$mode" = pfx ]; then env -u DISPLAY HOME="$HOSTHOME" WINEPREFIX="$compat/pfx" "${wsrv:-wineserver}" -w >> "$out" 2>&1; fi
+    echo "wine-cros: exit code $rc" >> "$out"
+    # keep a copy: the launching side deletes the log as soon as the request is done
+    mkdir -p "$RUN/history" && cp "$out" "$RUN/history/$id.log"
+    ls -t "$RUN"/history/*.log 2>/dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done
+    echo "$rc" > "$RUN/$id.done"
+  )
+  log "request $id finished"
+}
+
+while :; do
+  cur=; read -r cur < "$ME" 2>/dev/null
+  if [ "$cur" != "$$" ]; then log "a newer daemon took over, exiting"; exit 0; fi
+  touch "$RUN/alive"
+  for r in "$RUN"/*.req; do
+    [ -e "$r" ] || continue
+    id=$(basename "$r" .req)
+    mv "$r" "$RUN/$id.run" || continue
+    run_request "$id" &
+  done
+  for k in "$RUN"/*.kill; do
+    [ -e "$k" ] || continue
+    id=$(basename "$k" .kill); rm -f "$k"
+    log "kill request for $id"
+    if [ -r "$RUN/$id.pid" ]; then kill "$(cat "$RUN/$id.pid")" 2>/dev/null; fi
+    wenv wineserver -k 2>/dev/null
+  done
+  sleep 0.3
+done

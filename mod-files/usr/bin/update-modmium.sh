@@ -19,9 +19,9 @@ repo=$(cat /usr/share/.gitrepo 2>/dev/null)
 if ! which git &>/dev/null || ! which file &>/dev/null; then
   echo -e "${R}Dependencies not installed, installing...${N}"
   source /etc/profile # required to get emerge working in mosh
-  if [[ ! -f /mnt/stateful_partition/.devinstall_complete ]]; then
+  if [[ ! -f ${markdir}/.devinstall_complete ]]; then
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
-    touch /mnt/stateful_partition/.devinstall_complete
+    touch ${markdir}/.devinstall_complete
   fi
   ldconfig # reload shared libraries to include python libs
   emerge git file
@@ -117,6 +117,7 @@ updateModmium() {
   cd /mnt/stateful_partition/git
   [[ -d modmium ]] && rm -rf modmium
   if has_ssh_key; then
+    mkdir -p /home/chronos/user/.ssh # Silence warnings about known hosts.
     git clone --depth 1 -b $branch --single-branch git@github.com:${owner:-CrOSmium}/${repo:-modmium}.git || fail "${R}Failed to clone repository, exiting...${N}"
   else
     git clone --depth 1 -b $branch --single-branch https://github.com/${owner:-CrOSmium}/${repo:-modmium}.git || fail "${R}Failed to clone repository, exiting...${N}"
@@ -333,7 +334,7 @@ installCros() {
   if [[ ! $REPLY =~ ^[Nn]$ ]]; then
     echo -e "${G}Uninstalling packages...${N}"
     printf 'y\n' | dev_install --uninstall
-    rm -f /mnt/stateful_partition/.devinstall_complete
+    rm -f ${markdir}/.devinstall_complete
   else
     echo -e "${B}Keeping packages installed.${N}"
   fi
@@ -427,7 +428,7 @@ toggleBootPriority(){
   if [[ "$devp" =~ ^[Yy]$ ]]; then
     echo -e "${G}Uninstalling packages...${N}"
     printf 'y\n' | dev_install --uninstall
-    rm -f /mnt/stateful_partition/.devinstall_complete
+    rm -f ${markdir}/.devinstall_complete
   else
     echo -e "${B}Keeping packages installed.${N}"
   fi

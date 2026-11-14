@@ -12,9 +12,9 @@ fail(){
 if ! which git &>/dev/null || ! which file &>/dev/null; then
   echo -e "${R}Dependencies not installed, installing...${N}"
   source /etc/profile # required to get emerge working in mosh
-  if [[ ! -f /mnt/stateful_partition/.devinstall_complete ]]; then
+  if [[ ! -f ${markdir}/.devinstall_complete ]]; then
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
-    touch /mnt/stateful_partition/.devinstall_complete
+    touch ${markdir}/.devinstall_complete
   fi
   ldconfig # reload shared libraries to include python libs
   emerge git file
@@ -36,7 +36,7 @@ echo -e "${D}Created by Pilot Bell and DMD${N}"
 echo -e "This creates a local account, so ${R}account specific features may not work${N}, or may have major bugs.\nIf you run into any Modmium specific problems, create an issue on the GitHub.\n"
 echo -e "What would you like your local account's USERNAME to be?"
 echo -ne "[USERNAME]: "
-read -re username 
+read -re username
 username=$(echo "$username" | tr ' ' '.' | tr '[:upper:]' '[:lower:]')
 while true; do
   echo -ne "[CUSTOM DOMAIN (press enter for modmium.dev)]: "
@@ -52,7 +52,7 @@ U="$username@$domain"
 echo -e "Your account's email will be '${G}$U${N}'"
 while true; do
   echo -ne "[PASSWORD]: "
-  read -rse pass 
+  read -rse pass
   echo ""
   echo -ne "[CONFIRM PASSWORD]: "
   read -rse passconf

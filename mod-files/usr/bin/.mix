@@ -49,8 +49,8 @@ case "$1" in
     fi
     ;;
   list)
-    which less || mix install less &>/dev/null
-    nix-env -q
+    which less &>/dev/null || mix install less &>/dev/null
+    nix-env -q > less
     ;;
   revert)
     nix-env --rollback
@@ -82,7 +82,7 @@ EOF
     if [ -n "$2" ]; then
       for p in "${@:2}"; do
         nix-env -e "$p"
-      done 
+      done
       nix-collect-garbage -d
     else
       echo "Usage: mix remove <package>"

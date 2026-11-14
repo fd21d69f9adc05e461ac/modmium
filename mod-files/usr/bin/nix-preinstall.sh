@@ -13,14 +13,6 @@ installNix(){
   runscript /usr/bin/.nix-install.sh
 }
 
-mixupd(){
-  echo -e "Updating mix..."
-  sudo cp /usr/bin/.mix /usr/bin/mix
-  sleep 1
-  echo -e "Done!"
-  sleep 0.6
-}
-
 updateMix(){
   runscriptnoroot mixupd
 }
@@ -31,8 +23,8 @@ installWl(){
 
 menu_reset(){
   if [[ -f $MARKER ]]; then
-    options=("Install Nix" "Update ${G}Mix${N}" "Setup GUI" "Go Back")
-    functions=("installNix" "updateMix" "installWl" "quit")
+    options=("Install Nix" "Setup GUI" "Go Back")
+    functions=("installNix" "installWl" "quit")
   else
     options=("Install Nix" "Go Back")
     functions=("installNix" "quit")

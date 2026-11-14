@@ -4,3 +4,10 @@ pcm_type.cras {
 ctl_type.cras {
     lib "/usr/lib64/alsa-lib/libasound_module_ctl_cras.so"
 }
+pcm.wine_cras {
+    type cras
+}
+pcm.!default {
+    type plug
+    slave.pcm "wine_cras"
+}

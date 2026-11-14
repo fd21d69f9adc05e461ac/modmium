@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""steam-set-compat CONFIG_VDF TOOL
+
+Make TOOL (a compatibility tool name) Steam's default compatibility tool and replace
+every per-game Proton choice with it. Run while Steam is NOT running: Steam rewrites
+config.vdf when it exits. A backup is kept as config.vdf.wine-cros.bak (first run only).
+"""
+import os
+import re
+import shutil
+import sys
+
+TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])')
+ESC = {"n": "\n", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def unescape(s):
+    return re.sub(r"\\(.)", lambda m: ESC.get(m.group(1), "\\" + m.group(1)), s)
+
+
+def escape(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+
+
+def parse(text):
+    """-> list of (key, value) pairs; value is a str or a nested list of pairs"""
+    toks = [(m.group(1), m.group(2)) for m in TOKEN.finditer(text)]
+    pos = 0
+
+    def block():
+        nonlocal pos
+        items = []
+        while pos < len(toks):
+            s, br = toks[pos]
+            if br == "}":
+                pos += 1
+                return items
+            if br == "{":
+                raise ValueError("unexpected {")
+            key = unescape(s)
+            pos += 1
+            if pos >= len(toks):
+                raise ValueError("truncated file")
+            s2, br2 = toks[pos]
+            if br2 == "{":
+                pos += 1
+                items.append((key, block()))
+            elif br2 == "}":
+                raise ValueError("key without value")
+            else:
+                pos += 1
+                items.append((key, unescape(s2)))
+        return items
+
+    return block()
+
+
+def dump(items, depth=0):
+    out = []
+    pad = "\t" * depth
+    for k, v in items:
+        if isinstance(v, list):
+            out.append('%s"%s"\n%s{\n%s%s}\n' % (pad, escape(k), pad, dump(v, depth + 1), pad))
+        else:
+            out.append('%s"%s"\t\t"%s"\n' % (pad, escape(k), escape(v)))
+    return "".join(out)
+
+
+def child(items, key, create=True):
+    for k, v in items:
+        if k.lower() == key.lower() and isinstance(v, list):
+            return v
+    if not create:
+        return None
+    new = []
+    items.append((key, new))
+    return new
+
+
+def setval(items, key, value):
+    for i, (k, v) in enumerate(items):
+        if k == key and not isinstance(v, list):
+            items[i] = (k, value)
+            return
+    items.append((key, value))
+
+
+def getval(items, key):
+    for k, v in items:
+        if k == key and not isinstance(v, list):
+            return v
+    return None
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    path, tool = sys.argv[1], sys.argv[2]
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        root = parse(f.read())
+    store = child(root, "InstallConfigStore")
+    steam = child(child(child(store, "Software"), "Valve"), "Steam")
+    mapping = child(steam, "CompatToolMapping")
+
+    changed = []
+    for i, (k, v) in enumerate(mapping):
+        if not isinstance(v, list) or k == "0":
+            continue
+        name = getval(v, "name") or ""
+        if name != tool and (name.lower().startswith(("proton", "steamlinuxruntime")) or name == "wine-cros"):
+            setval(v, "name", tool)
+            setval(v, "config", "")
+            changed.append(k)
+    default = child(mapping, "0")
+    if getval(default, "name") != tool:
+        setval(default, "name", tool)
+        setval(default, "config", "")
+        setval(default, "priority", "75")
+        changed.append("0")
+
+    if not changed:
+        print("steam-set-compat: already using %s" % tool)
+        return
+    bak = path + ".wine-cros.bak"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(dump(root))
+    shutil.copystat(path, tmp)
+    st = os.stat(path)
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)  # we run as root, Steam does not
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    print("steam-set-compat: %s is now used for app(s) %s" % (tool, ", ".join(changed)))
+
+
+if __name__ == "__main__":
+    main()

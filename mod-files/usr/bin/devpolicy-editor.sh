@@ -3,6 +3,8 @@
 
 source /root/.bashrc # to get $EDITOR
 jsonFile="/usr/local/share/policy-test-tool/dump.json"
+source /usr/lib/libmosh.sh
+[[ -e $markdir ]] || mkdir $markdir
 DEVINSTALL_FILE="$markdir/devinstall_complete"
 DEVPOL_FILE="$markdir/devpol_setup"
 PYTHON_PROTOSKID="$markdir/python_protoskid" # this just checks for the packages themselves, i was too lazy to rename it after changing that.
@@ -16,8 +18,6 @@ fail(){
 stty -echo
 tput civis
 clear
-
-source /usr/lib/libmosh.sh
 
 if [[ ! -f $DEVPOL_FILE ]] || [[ ! -d /usr/local/share/policy-test-tool ]]; then
   mkdir -p /usr/local/share

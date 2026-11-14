@@ -1,0 +1,52 @@
+#!/bin/bash
+# steam-patch-bwrap - replace Steam's bundled srt-bwrap with a stub that applies no
+# isolation. Run once after steam-launch has unpacked the Steam runtime (re-run it
+# if a Steam runtime update restores the original).
+#
+# Why: on ChromeOS the Chromium OS LSM refuses the tmpfs mount bwrap makes inside a
+# user namespace ("Mounting a filesystem with 'exec' flag requires CAP_SYS_ADMIN in
+# init ns"), so the real srt-bwrap can never work here, and Steam refuses to start
+# without a working one. The stub lets that startup check pass. Anything that needs
+# a real container (Proton (without our pfx runner), Steam Linux Runtime games) will fail with a clear message.
+#
+# Only the copy under ubuntu12_32 (the one the startup check runs) is replaced. The
+# copies under steamrt64/pv-runtime are checksummed by Steam: replacing those made it
+# re-download and re-extract the runtime on every start, so they are restored here.
+set -euo pipefail
+H=${STEAM_HOME:-/usr/local/steam-home}
+S=$H/.local/share/Steam
+while IFS= read -r real; do
+  f=${real%.real}
+  case $f in "$S/ubuntu12_32/"*) continue ;; esac
+  mv -f "$real" "$f"; echo "restored original: $f"
+done < <(find "$S" -name 'srt-bwrap.real' 2>/dev/null)
+mapfile -t files < <(find "$S/ubuntu12_32" \( -type f -o -type l \) -name srt-bwrap 2>/dev/null)
+[ "${#files[@]}" -gt 0 ] || { echo "no srt-bwrap found under $S/ubuntu12_32 - run steam-launch once first" >&2; exit 1; }
+for f in "${files[@]}"; do
+  if [ "$(head -c 2 "$f")" = '#!' ]; then echo "already patched: $f"; continue; fi
+  mv "$f" "$f.real"
+  cat > "$f" <<'STUB'
+#!/bin/sh
+# srt-bwrap stand-in for ChromeOS: accepts bwrap's options, applies none of the
+# isolation, and runs the command. Unsupported options fail loudly.
+case $1 in --version|--help) exec "$0.real" "$@" ;; esac
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bind|--ro-bind|--dev-bind|--bind-try|--ro-bind-try|--dev-bind-try|--symlink) shift 3 ;;
+    --tmpfs|--proc|--dev|--dir|--remount-ro|--perms|--size|--uid|--gid|--hostname|--cap-add|--cap-drop|--lock-file|--chmod|--exec-label|--file-label) shift 2 ;;
+    --chdir) cd "$2" || exit 1; shift 2 ;;
+    --setenv) export "$2=$3"; shift 3 ;;
+    --unsetenv) unset "$2"; shift 2 ;;
+    --unshare-*|--share-net|--die-with-parent|--new-session|--as-pid-1|--disable-userns|--assert-userns-disabled) shift ;;
+    --) shift; break ;;
+    -*) echo "srt-bwrap (ChromeOS stub): unsupported option $1 - containers are not available here" >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "srt-bwrap (ChromeOS stub): no command given" >&2; exit 1; }
+exec "$@"
+STUB
+  chmod 755 "$f"
+  chown --reference="$f.real" "$f" 2>/dev/null || true
+  echo "patched: $f"
+done

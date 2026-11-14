@@ -14,7 +14,7 @@ as_system() {
 selected_index=0
 branch=$(cat /.branch)
 modver=$(cat /usr/share/.version)
-markdir=/usr/local/.markers; mkdir -p $markdir
+markdir=/usr/local/.markers
 shellfile=/root/.modshell
 shell="bash"
 [ -s "$shellfile" ] && shell=$(<"$shellfile")

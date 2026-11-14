@@ -1,0 +1,837 @@
+#!/bin/bash
+# steam-launch - start the nixpkgs Steam wrapper (steam-cros) as an unprivileged
+# user inside bwrap-cros, with a rootful Xwayland as its X server.
+#
+#   STEAM_UID / STEAM_GID   user to run as (default 1000:1000, ChromeOS "chronos")
+#   STEAM_GROUPS            numeric supplementary groups (default: chronos's groups)
+#   STEAM_HOME              host dir for Steam's home and games (default
+#                           /usr/local/steam-home); appears as /steam-home inside.
+#                           Must be on /usr/local: the stateful partition itself is
+#                           noexec and blocks symlinks.
+#   STEAM_DISPLAY           X display number for Xwayland (default 90)
+#   STEAM_XGEOMETRY         size of the Xwayland window (default: the logical screen size, read from the compositor)
+#   STEAM_XFULLSCREEN=1     fullscreen Xwayland window instead of a framed one (keeps the
+#                           STEAM_XGEOMETRY screen size; the compositor stretches it)
+#   STEAM_XDEBUG=1          WLSHIM_DEBUG for Xwayland (see xwayland.log)
+#   STEAM_REFRESH=1         ignore the cache once and rebuild/re-resolve everything
+#   STEAM_PROTON_LIBS       nixpkgs libraries added to the games' library path ("attr|older attr"
+#                           pairs, space separated; default list built in)
+#   STEAM_PROTON_EXTRA_LIBDIRS  more library directories for games, colon separated
+#   steam-wine-daemon has more settings of its own (STEAM_GAME_*, see its header)
+#   STEAM_HIDPI=1           render at the output scale (Xwayland -hidpi, windowed only) and let
+#                           Exo downscale: sharp instead of a blurry upscale. Sets Steam UI
+#                           scaling to the output scale (STEAM_UI_SCALE overrides) and scales
+#                           the cursor size by it. NOTE: causes lag due to rendering the client
+#                           at such a high resolution.
+#   STEAM_NO_MAXIMIZE=1     do not make openbox maximize Steam's main window
+#   STEAM_BG                root window colour behind everything (default #1b2838)
+#   STEAM_CURSOR_THEME      cursor theme (default Adwaita, from nixpkgs adwaita-icon-theme)
+#   STEAM_CURSOR_SIZE       cursor size; default is read from /usr/local/.markers/curSize
+#                           (STEAM_CURSOR_MARKER=path to use another file), as wl does
+#   STEAM_WM                nixpkgs window manager to start inside X (default
+#                           openbox; STEAM_WM= for none)
+#   XWAYLAND_GALLIUM        Mesa driver for Xwayland's GPU path (default iris)
+#   XWAYLAND_ARGS           extra Xwayland arguments
+#   STEAM_WEBHELPER_LIBS    nixpkgs attributes whose libs steamwebhelper may use (space
+#                           separated; default list built in, ibus etc.)
+#   Extra arguments go to Steam, e.g. steam-launch -no-cef-sandbox -cef-disable-gpu
+[[ $EUID != 0 ]] && (echo "Must be ran as root." && exit 1)
+set -euo pipefail
+export STEAM_UIDN=${STEAM_UID:-1000} STEAM_GIDN=${STEAM_GID:-1000}
+export STEAM_HOME_DIR=${STEAM_HOME:-/usr/local/steam-home}
+export STEAM_RT=/run/user/$STEAM_UIDN
+export STEAM_SUPP=${STEAM_GROUPS:-$(id -G chronos 2>/dev/null | tr ' ' ',' || true)}
+export STEAM_DISP=${STEAM_DISPLAY:-90} STEAM_XGEOM=${STEAM_XGEOMETRY:-}
+export STEAM_CACHE=/usr/local/.nixcache STEAM_REFRESH=${STEAM_REFRESH:-} STEAM_XDEBUG=${STEAM_XDEBUG:-}
+export STEAM_HIDPI=${STEAM_HIDPI:-}
+export STEAM_XFS=${STEAM_XFULLSCREEN:-} STEAM_NOMAX=${STEAM_NO_MAXIMIZE:-} STEAM_BGC=${STEAM_BG:-#1b2838}
+export STEAM_WMNAME=${STEAM_WM-openbox} STEAM_XARGS=${XWAYLAND_ARGS:-}
+export STEAM_XGALLIUM=${XWAYLAND_GALLIUM:-iris}
+
+mkdir -p "$STEAM_HOME_DIR" "$STEAM_RT" /tmp/.X11-unix
+chown "$STEAM_UIDN:$STEAM_GIDN" "$STEAM_HOME_DIR" "$STEAM_RT"
+chmod 700 "$STEAM_RT"; chmod 1777 /tmp/.X11-unix
+
+# steam-patch-bwrap: from PATH, else next to this script (also under the name with a leading dot)
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+pb=$(command -v steam-patch-bwrap 2>/dev/null || true)
+export STEAM_PATCH_BWRAP=$pb
+if [ -z "$pb" ]; then
+    echo "warning: steam-patch-bwrap not found: Steam will not start until it is run by hand" >&2
+else
+    # the runtime of an earlier session may have been restored by an update: patch it right away
+    bash "$pb" >/dev/null 2>&1 || true
+fi
+
+# steamwebhelper (the browser that draws Steam's UI) is started through pressure-vessel,
+# whose bwrap cannot mount a tmpfs here. steamwebhelper.sh takes the runtime location from
+# STEAM_RUNTIME_STEAMRT and only calls "<it>/_v2-entry-point -- command...", so point it at a
+# fake entry point that runs the command directly on the host side of the sandbox.
+mkdir -p "$STEAM_HOME_DIR/pv-bypass"
+export STEAM_RUNTIME_STEAMRT=/steam-home/pv-bypass
+# the CEF sandbox needs what the container would have given it
+case " $* " in (*\ -no-cef-sandbox\ *) ;; (*) set -- -no-cef-sandbox "$@" ;; esac
+
+# --- games: the proton-cros compatibility tool ---------------------------------------
+# Proton itself cannot run here (pressure-vessel needs mounts ChromeOS LSM blocks), so Windows games
+# go to the host Wine instead. The tool script below runs inside the Steam sandbox and hands
+# each launch to steam-wine-daemon, which runs it outside with the usual wl environment.
+if [ -d "$STEAM_HOME_DIR/.local/share/Steam" ]; then
+  # the name starts with "proton" on purpose: Steam Cloud only resolves the Windows folders of a
+  # game (WinAppDataLocal and so on) for tools whose name looks like Valve's proton_*
+  export STEAM_TOOL_NAME=proton-cros
+  tooldir=$STEAM_HOME_DIR/.local/share/Steam/compatibilitytools.d/$STEAM_TOOL_NAME
+  mkdir -p "$tooldir"
+  cat > "$tooldir/compatibilitytool.vdf" <<WINECROS_VDF_EOF
+"compatibilitytools"
+{
+	"compat_tools"
+	{
+		"$STEAM_TOOL_NAME"
+		{
+			"install_path"	"."
+			"display_name"	"Wine (ChromeOS host)"
+			"from_oslist"	"windows"
+			"to_oslist"	"linux"
+		}
+	}
+}
+WINECROS_VDF_EOF
+  # Steam treats the tool as a Proton-style layer (compatmanager_layer_name, use_sessions)
+  printf '"manifest"\n{\n\t"version"\t"2"\n\t"commandline"\t"/proton %%verb%%"\n\t"use_sessions"\t"1"\n\t"compatmanager_layer_name"\t"proton"\n}\n' > "$tooldir/toolmanifest.vdf"
+  cat > "$tooldir/proton" <<'WINECROS_PROTON_EOF'
+#!/bin/bash
+# proton-cros: the Steam compatibility tool script. It hands the game to steam-wine-daemon,
+# which runs it with the host Wine outside the Steam sandbox, and relays its output and exit code.
+# The Steam overlay (LD_PRELOAD) is of no use here and spams the terminal.
+unset LD_PRELOAD
+verb=${1:-}
+[ $# -gt 0 ] && shift
+RUN=/steam-home/gamerun
+
+case $verb in
+  getcompatpath) p=${1:-}; printf 'Z:%s\n' "${p//\//\\}"; exit 0 ;;
+  getnativepath)
+    # Windows path -> path on this system: C: is the prefix drive, any other drive is the root
+    p=${1:-}
+    case $p in
+      [Cc]:*) p=${p:2}; p=${p//\\//}; printf '%s\n' "${STEAM_COMPAT_DATA_PATH%/}/pfx/drive_c$p" ;;
+      [A-Za-z]:*) p=${p:2}; printf '%s\n' "${p//\\//}" ;;
+      *) printf '%s\n' "$p" ;;
+    esac
+    exit 0 ;;
+  run|waitforexitandrun|runinprefix) ;;
+  *) echo "proton-cros: unsupported verb '$verb'" >&2; exit 1 ;;
+esac
+
+# the daemon touches this file every 0.3 s
+if [ ! -e "$RUN/alive" ] || [ $(( $(date +%s) - $(stat -c %Y "$RUN/alive") )) -gt 10 ]; then
+  echo "proton-cros: the game daemon is not running; start Steam with steam-launch" >&2
+  exit 1
+fi
+
+id=$$-$(date +%s%N)
+tmp=$RUN/$id.tmp
+{
+  printf 'cwd\0%s\0' "$PWD"
+  for a in "$@"; do printf 'arg\0%s\0' "$a"; done
+  # pass launch options and Steam's variables on; not the sandbox's own library setup
+  while IFS= read -r -d '' kv; do
+    case ${kv%%=*} in
+      # Steam inherits the wl environment (WINEPREFIX=/usr/local/wine64 ...); the daemon
+      # picks the Wine, its libraries and the prefix itself
+      WINEPREFIX|WINELOADER|WINESERVER|WINEDLLPATH) ;;
+      WINE*|DXVK*|VKD3D*|MESA*|mesa_*|STEAM*|Steam*|SDL_*|PROTON_*|WLSHIM_*|__GL*|__NV*|LANG|LC_*|vblank_mode|MANGOHUD*|FNA*|DOTNET_*|MONO_*|TZ|ENABLE_*|RADV_*|ANV_*|INTEL_*|ZINK_*|GALLIUM_*|LIBGL_*)
+        printf 'env\0%s\0' "$kv" ;;
+    esac
+  done < <(env -0)
+} > "$tmp"
+mv "$tmp" "$RUN/$id.req"
+
+# relay the game's output to Steam's console as it appears. Only bash builtins in the loop: the
+# Steam overlay hooks every program started from here (and prints a line for each one)
+log=$RUN/$id.log
+lfd=
+mkfifo "$RUN/$id.sl" && exec {sfd}<>"$RUN/$id.sl"
+flush_log() {
+  local chunk
+  if [ -z "$lfd" ]; then
+    [ -e "$log" ] && exec {lfd}<"$log" || return 0
+  fi
+  while IFS= read -r -u "$lfd" -N 65536 chunk || [ -n "$chunk" ]; do
+    printf '%s' "$chunk"; chunk=
+  done
+}
+stop() { touch "$RUN/$id.kill"; }
+trap stop TERM INT HUP
+
+while [ ! -e "$RUN/$id.done" ]; do flush_log; read -r -t 0.3 -u "$sfd" _ || true; done
+flush_log
+rc=
+read -r rc < "$RUN/$id.done" 2>/dev/null
+rm -f "$RUN/$id".*
+exit "${rc:-1}"
+WINECROS_PROTON_EOF
+  chmod 755 "$tooldir/proton"
+  chown -R "$STEAM_UIDN:$STEAM_GIDN" "$tooldir"
+fi
+
+# Steamworks games: a game's DRM stub wants Valve's real steamclient(64).dll, which Wine can
+# only use when redirected to lsteamclient. The stand-in DLLs doing that are built from this
+# source with nixpkgs mingw (below, cached) and installed into the game prefix by the daemon.
+mkdir -p "$STEAM_CACHE"
+rsrc=$STEAM_CACHE/redirect-src
+mkdir -p "$rsrc"
+cat > "$rsrc/steamclient-redirect.c" <<'WINECROS_REDIRECT_C_EOF'
+/*
+ * steamclient-redirect: stand-in for tier0_s(64).dll and vstdlib_s(64).dll.
+ *
+ * Valve's Windows steamclient(64).dll cannot work under Wine: it expects to talk to a Windows
+ * Steam client. Proton's patched Wine therefore loads the genuine DLL (DRM stubs inspect it) and
+ * overwrites every export that lsteamclient (the bridge to the native Steam client) also
+ * provides with a jump into lsteamclient. This DLL does the same without patching Wine.
+ *
+ * It is installed under the names of the two libraries steamclient imports. Wine initialises
+ * imported DLLs before the importing DLL's entry point, so our DllMain runs after the real
+ * steamclient is mapped and before its own DllMain, which is exactly the moment to patch it.
+ * Missing imports from this (export-less) DLL are harmless: Wine only allocates stubs for them.
+ *
+ * Build (see steamclient-redirect.nix), freestanding, kernel32 only:
+ *   x86_64: -Wl,-e,DllMain        i386: -Wl,-e,_DllMain@12
+ */
+#include <windows.h>
+#include <stddef.h>
+
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } STR16;
+typedef struct
+{
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    STR16 FullDllName;
+} LDR_ENTRY;
+typedef struct
+{
+    ULONG Length;
+    BOOLEAN Initialized;
+    HANDLE SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+} LDR_DATA;
+
+#ifdef _WIN64
+#define PEB_LDR_OFFSET 0x18
+static const BYTE entry_stub[] = { 0xB8, 1, 0, 0, 0, 0xC3 };                 /* mov eax,1; ret */
+#else
+#define PEB_LDR_OFFSET 0x0C
+static const BYTE entry_stub[] = { 0xB8, 1, 0, 0, 0, 0xC2, 0x0C, 0x00 };     /* mov eax,1; ret 12 */
+#endif
+
+static const WCHAR *const targets[] =
+{
+    L"steamclient.dll", L"steamclient64.dll",
+    L"gameoverlayrenderer.dll", L"gameoverlayrenderer64.dll",
+};
+
+static WCHAR lower(WCHAR c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static int is_target(const STR16 *path)
+{
+    const WCHAR *p = path->Buffer, *base = p, *end = p + path->Length / sizeof(WCHAR);
+    unsigned int i;
+
+    if (!p) return 0;
+    for (; p < end; p++) if (*p == '\\' || *p == '/') base = p + 1;
+    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++)
+    {
+        const WCHAR *a = base, *b = targets[i];
+        while (a < end && *b && lower(*a) == *b) { a++; b++; }
+        if (a == end && !*b) return 1;
+    }
+    return 0;
+}
+
+static void patch_bytes(void *dst, const void *src, SIZE_T n)
+{
+    DWORD old;
+    SIZE_T i;
+
+    if (!VirtualProtect(dst, n, PAGE_EXECUTE_READWRITE, &old)) return;
+    for (i = 0; i < n; i++) ((volatile BYTE *)dst)[i] = ((const BYTE *)src)[i];
+    VirtualProtect(dst, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), dst, n);
+}
+
+static void write_jump(void *dst, void *target)
+{
+#ifdef _WIN64
+    BYTE code[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    ULONGLONG a = (ULONGLONG)(ULONG_PTR)target;
+    int i;
+    for (i = 0; i < 8; i++) code[2 + i] = (BYTE)(a >> (8 * i));
+#else
+    BYTE code[7] = { 0xB8, 0, 0, 0, 0, 0xFF, 0xE0 };
+    ULONG a = (ULONG)(ULONG_PTR)target;
+    int i;
+    for (i = 0; i < 4; i++) code[1 + i] = (BYTE)(a >> (8 * i));
+#endif
+    patch_bytes(dst, code, sizeof(code));
+}
+
+static int same_bytes(const BYTE *a, const BYTE *b, SIZE_T n)
+{
+    SIZE_T i;
+    for (i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+#ifndef _WIN64
+/* a 32-bit steamclient is checked against the ImageBase in its file header; relocation may
+ * have rewritten the one in memory (same fix as Valve's loader) */
+static void restore_image_base(IMAGE_NT_HEADERS *nt, const STR16 *path)
+{
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS file_nt;
+    DWORD got;
+    HANDLE f;
+
+    if (!path->Buffer) return;
+    f = CreateFileW(path->Buffer, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    if (ReadFile(f, &dos, sizeof(dos), &got, NULL) && got == sizeof(dos) &&
+        SetFilePointer(f, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER &&
+        ReadFile(f, &file_nt, sizeof(file_nt), &got, NULL) && got == sizeof(file_nt) &&
+        file_nt.OptionalHeader.ImageBase != nt->OptionalHeader.ImageBase)
+    {
+        DWORD base = file_nt.OptionalHeader.ImageBase;
+        patch_bytes(&nt->OptionalHeader.ImageBase, &base, sizeof(base));
+    }
+    CloseHandle(f);
+}
+#endif
+
+static void patch_module(BYTE *base, const STR16 *path, HMODULE bridge)
+{
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    BYTE *entry = nt->OptionalHeader.AddressOfEntryPoint ? base + nt->OptionalHeader.AddressOfEntryPoint : NULL;
+    DWORD i;
+
+    if (entry && same_bytes(entry, entry_stub, sizeof(entry_stub))) return;  /* already done */
+
+    if (dir->VirtualAddress)
+    {
+        IMAGE_EXPORT_DIRECTORY *ex = (IMAGE_EXPORT_DIRECTORY *)(base + dir->VirtualAddress);
+        const DWORD *names = (const DWORD *)(base + ex->AddressOfNames);
+        const DWORD *funcs = (const DWORD *)(base + ex->AddressOfFunctions);
+        const WORD *ords = (const WORD *)(base + ex->AddressOfNameOrdinals);
+
+        for (i = 0; i < ex->NumberOfNames; i++)
+        {
+            DWORD rva = funcs[ords[i]];
+            FARPROC target;
+
+            if (rva >= dir->VirtualAddress && rva < dir->VirtualAddress + dir->Size) continue;  /* forward */
+            if (!(target = GetProcAddress(bridge, (const char *)(base + names[i])))) continue;
+            write_jump(base + rva, (void *)target);
+        }
+    }
+    if (entry) patch_bytes(entry, entry_stub, sizeof(entry_stub));
+#ifndef _WIN64
+    restore_image_base(nt, path);
+#endif
+}
+
+static void redirect(void)
+{
+    BYTE *peb;
+    LDR_DATA *ldr;
+    LIST_ENTRY *head, *e;
+    BYTE *bases[8];
+    const STR16 *paths[8];
+    unsigned int n = 0, i;
+    HMODULE bridge;
+
+#ifdef _WIN64
+    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(peb));
+#else
+    __asm__ __volatile__("movl %%fs:0x30, %0" : "=r"(peb));
+#endif
+    ldr = *(LDR_DATA **)(peb + PEB_LDR_OFFSET);
+    if (!ldr) return;
+
+    /* collect first: loading lsteamclient below changes the list */
+    head = &ldr->InMemoryOrderModuleList;
+    for (e = head->Flink; e != head && n < 8; e = e->Flink)
+    {
+        LDR_ENTRY *m = (LDR_ENTRY *)((BYTE *)e - offsetof(LDR_ENTRY, InMemoryOrderLinks));
+        if (!m->DllBase || !is_target(&m->FullDllName)) continue;
+        bases[n] = (BYTE *)m->DllBase;
+        paths[n] = &m->FullDllName;
+        n++;
+    }
+    if (!n) return;
+
+    if (!(bridge = LoadLibraryW(L"lsteamclient.dll")))
+    {
+        OutputDebugStringA("steamclient-redirect: lsteamclient.dll not found, leaving steamclient untouched\n");
+        return;
+    }
+    for (i = 0; i < n; i++) patch_module(bases[i], paths[i], bridge);
+    OutputDebugStringA("steamclient-redirect: steamclient redirected to lsteamclient\n");
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_ATTACH) redirect();
+    return TRUE;
+}
+WINECROS_REDIRECT_C_EOF
+cat > "$rsrc/default.nix" <<'WINECROS_REDIRECT_NIX_EOF'
+# Builds the four stand-in DLLs of steamclient-redirect.c:
+#
+#   nix-build steamclient-redirect.nix -o /usr/local/steamclient-redirect
+#
+# Result: x86_64-windows/{tier0_s64,vstdlib_s64}.dll and i386-windows/{tier0_s,vstdlib_s}.dll
+{ pkgs ? import <nixpkgs> { } }:
+let
+  cc64 = pkgs.pkgsCross.mingwW64.stdenv.cc;
+  cc32 = pkgs.pkgsCross.mingw32.stdenv.cc;
+  flags = "-O1 -ffreestanding -fno-tree-loop-distribute-patterns -fno-stack-protector -shared -nostdlib -s -Wall";
+in
+pkgs.runCommand "steamclient-redirect" { nativeBuildInputs = [ cc64 cc32 ]; } ''
+  mkdir -p $out/x86_64-windows $out/i386-windows
+  for n in tier0_s64 vstdlib_s64; do
+    x86_64-w64-mingw32-gcc ${flags} -Wl,-e,DllMain -o $out/x86_64-windows/$n.dll ${./steamclient-redirect.c} -lkernel32
+  done
+  for n in tier0_s vstdlib_s; do
+    i686-w64-mingw32-gcc ${flags} -Wl,-e,_DllMain@12 -o $out/i386-windows/$n.dll ${./steamclient-redirect.c} -lkernel32
+  done
+''
+WINECROS_REDIRECT_NIX_EOF
+export STEAM_REDIRECT_SRC=$rsrc
+
+# nix tools come from wl's environment
+exec wl bash -c '
+  set -e
+  # nix-build results are cached in $STEAM_CACHE/<attr> (one store path per line) and only
+  # rebuilt when a cached path has vanished (nix-collect-garbage) or STEAM_REFRESH is set
+  mkdir -p "$STEAM_CACHE"
+  nball() {
+    c=$STEAM_CACHE/$1; ok=
+    if [ -z "$STEAM_REFRESH" ] && [ -s "$c" ]; then
+      ok=1
+      while read -r p; do [ -e "$p" ] || ok=; done < "$c"
+    fi
+    if [ -z "$ok" ]; then
+      if nix-build "<nixpkgs>" -A "$1" --no-out-link $NIXBARGS > "$c.tmp"; then mv "$c.tmp" "$c"; else rm -f "$c.tmp"; return 1; fi
+    fi
+    cat "$c"
+  }
+  nb() { nball "$1" | tail -n 1; }
+  # same for a nix file; the out-link under $STEAM_CACHE keeps the result from nix-collect-garbage
+  nbfile() {
+    c=$STEAM_CACHE/$1; ok=
+    if [ -z "$STEAM_REFRESH" ] && [ -s "$c" ]; then
+      ok=1
+      while read -r p; do [ -e "$p" ] || ok=; done < "$c"
+    fi
+    if [ -z "$ok" ]; then
+      if nix-build "$2" -o "$STEAM_CACHE/$1.out" $NIXBARGS > "$c.tmp"; then mv "$c.tmp" "$c"; else rm -f "$c.tmp"; return 1; fi
+    fi
+    cat "$c"
+  }
+  fonts=$(nb dejavu_fonts); util=$(nb util-linux.bin); xw=$(nb xwayland); dbus=$(nb dbus)
+  mesa64=$(nb mesa)
+  mesa32=; if [ -z "$STEAM_NOMESA32" ]; then mesa32=$(nb pkgsi686Linux.mesa); fi
+
+  # steam-cros: the nixpkgs Steam wrapper with bwrap-cros in place of bubblewrap, made from the
+  # wrapper nixpkgs builds so that its store paths follow nixpkgs updates. It is redone when
+  # that wrapper changes (or with STEAM_REFRESH); the wrapper gets a GC root so that
+  # nix-collect-garbage keeps everything the generated script points at
+  export NIXPKGS_ALLOW_UNFREE=1
+  if sw=$(nb steam) && [ -r "$sw/bin/steam" ]; then
+    scros=$STEAM_CACHE/steam-cros
+    if [ -n "$STEAM_REFRESH" ] || [ ! -x "$scros" ] || [ "$(cat "$scros.src" 2>/dev/null)" != "$sw" ]; then
+      sed -e "s|/nix/store/[a-z0-9]*-bubblewrap-[^/ ]*/bin/bwrap|/usr/bin/bwrap-cros|g" \
+        -e "s|--ro-bind /nix /nix|--bind /nix /nix|" "$sw/bin/steam" > "$scros.tmp" &&
+      chmod 755 "$scros.tmp" && mv "$scros.tmp" "$scros" && echo "$sw" > "$scros.src"
+    fi
+    nix-store --realise --add-root "$STEAM_CACHE/steam.root" --indirect "$sw" > /dev/null 2>&1 || true
+  fi
+  if [ -z "$scros" ] || [ ! -x "$scros" ]; then
+    echo "warning: could not make steam-cros from the nixpkgs steam wrapper (offline?); using steam-cros from PATH" >&2
+    scros=steam-cros
+  fi
+
+  # steamwebhelper runs on the host side (no pressure-vessel runtime), so give it the
+  # libraries Chromium wants from nixpkgs, via the fake entry point
+  wattrs=${STEAM_WEBHELPER_LIBS:-"ibus nss nspr atk at-spi2-atk at-spi2-core cups libdrm libxkbcommon pango cairo alsa-lib expat glib gtk3 libnotify"}
+  wlibs=
+  for a in $wattrs; do
+    for o in $(nball "$a" 2>/dev/null); do
+      if [ -d "$o/lib" ]; then wlibs="$wlibs:$o/lib"; fi
+    done
+  done
+  wlibs=${wlibs#:}
+  cat > "$STEAM_HOME_DIR/pv-bypass/_v2-entry-point" <<EOF
+#!/bin/sh
+[ "\$1" = -- ] && shift
+LD_LIBRARY_PATH="$wlibs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+b=/steam-home/.local/share/Steam/steamrt64/steamwebhelper
+if command -v ldd >/dev/null 2>&1; then ldd "\$b" 2>&1 | grep -i "not found" > /steam-home/webhelper-missing.txt; fi
+exec "\$@"
+EOF
+  chmod 755 "$STEAM_HOME_DIR/pv-bypass/_v2-entry-point"
+  chown -R "$STEAM_UIDN:$STEAM_GIDN" "$STEAM_HOME_DIR/pv-bypass"
+
+  ln -sfn "$mesa64" "/run/opengl-driver"
+  if [ -n "$mesa32" ]; then ln -sfn "$mesa32" "/run/opengl-driver-32"; fi
+  vkicd=$mesa64/share/vulkan/icd.d/intel_icd.x86_64.json
+  if [ -n "$mesa32" ]; then vkicd=$vkicd:$mesa32/share/vulkan/icd.d/intel_icd.i686.json; fi
+  ldpath=/run/opengl-driver/lib:/run/opengl-driver-32/lib
+  conf=$STEAM_HOME_DIR/fonts.conf
+  {
+    echo "<?xml version=\"1.0\"?>"
+    echo "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">"
+    echo "<fontconfig><dir>$fonts/share/fonts</dir><cachedir>/tmp/fontconfig-cache</cachedir></fontconfig>"
+  } > "$conf"
+  chown "$STEAM_UIDN:$STEAM_GIDN" "$conf"
+
+  # prefix that runs a command as the Steam user (chroot to "/" just drops privileges).
+  # Used as a plain command, never through a function, so "$!" is the real process.
+  asu=(chroot --userspec="$STEAM_UIDN:$STEAM_GIDN")
+  if [ -n "$STEAM_SUPP" ]; then asu+=(--groups="$STEAM_SUPP"); fi
+  asu+=(/)
+
+  # compositor output info: logical size (xdg_output) and the integer output scale
+  wi=$(nb wayland-utils)
+  info=$("$wi/bin/wayland-info" 2>/dev/null | tr "," "\n" || true)
+  outscale=$(printf "%s\n" "$info" | sed -n "s/^[[:space:]]*scale: *\([0-9][0-9]*\).*/\1/p" | head -n 1)
+  case $outscale in ""|*[!0-9]*) outscale=2 ;; esac
+
+  # cursor theme and size for everything running as the Steam user. wl exports XCURSOR_PATH
+  # under /root, which that user cannot read, so use the theme straight from the nix store.
+  adw=$(nb adwaita-icon-theme 2>/dev/null || true)
+  if [ ! -d "$adw/share/icons/Adwaita/cursors" ]; then adw=$(nb gnome.adwaita-icon-theme 2>/dev/null || true); fi
+  curtheme=${STEAM_CURSOR_THEME:-Adwaita}
+  curpath=
+  if [ -d "$adw/share/icons/Adwaita/cursors" ]; then
+    curpath=$adw/share/icons
+  else
+    echo "warning: no Adwaita cursor theme found in nixpkgs, keeping the default cursors" >&2
+  fi
+  # size: the same marker file wl reads, so X windows match native Wayland ones
+  cursize=${STEAM_CURSOR_SIZE:-}
+  if [ -z "$cursize" ]; then cursize=$(cat "${STEAM_CURSOR_MARKER:-/usr/local/.markers/curSize}" 2>/dev/null || true); fi
+  if [ -z "$cursize" ]; then cursize=${XCURSOR_SIZE:-24}; fi
+  # in hidpi mode X pixels are smaller by the output scale: scale the cursor to match
+  case $cursize in ""|*[!0-9]*) ;; *)
+    if [ -n "$STEAM_HIDPI" ] && [ -z "$STEAM_CURSOR_SIZE" ]; then cursize=$((cursize * outscale)); fi ;;
+  esac
+  curenv=(XCURSOR_SIZE="$cursize")
+  if [ -n "$curpath" ]; then curenv+=(XCURSOR_PATH="$curpath" XCURSOR_THEME="$curtheme"); fi
+
+  # screen size: the compositor logical size (xdg_output), unless STEAM_XGEOMETRY is set
+  geom=$STEAM_XGEOM
+  if [ -z "$geom" ]; then
+    lw=$(printf "%s\n" "$info" | sed -n "s/.*logical_width: *\([0-9][0-9]*\).*/\1/p" | head -n 1)
+    lh=$(printf "%s\n" "$info" | sed -n "s/.*logical_height: *\([0-9][0-9]*\).*/\1/p" | head -n 1)
+    if [ -n "$lw" ] && [ -n "$lh" ]; then
+      geom=${lw}x${lh}
+    else
+      geom=1500x937
+      echo "warning: could not read the logical screen size, using $geom (set STEAM_XGEOMETRY)" >&2
+    fi
+  fi
+
+  sock=/tmp/.X11-unix/X$STEAM_DISP
+  rm -f "$sock"
+  xlog=$STEAM_HOME_DIR/xwayland.log
+  # -ac: no X access control (local sockets only). Without -shm Xwayland uses its GPU
+  # path (glamor), which is what provides GLX; it goes through iris on a GBM device.
+  # fullscreen: let Xwayland see the logical size as its output mode (like Wine does)
+  xmode="-geometry $geom"
+  if [ -n "$STEAM_HIDPI" ]; then
+    # -hidpi only works for the windowed rootful mode: the X screen becomes the window
+    # size times the output scale, drawn with a matching buffer scale
+    xmode="$xmode -hidpi"
+    if [ -n "$STEAM_XFS" ]; then echo "warning: -hidpi does not work with fullscreen, ignoring STEAM_XFULLSCREEN (maximize the window instead)" >&2; fi
+  elif [ -n "$STEAM_XFS" ]; then
+    xmode="-fullscreen -geometry $geom"
+  fi
+  # processes left behind by earlier sessions (Steam closed hard; the old exit cleanup could not
+  # stop them, root may not signal them): game daemons, session buses, Xwayland, window manager.
+  # Matched on the start of the command line only, so this script never matches itself.
+  stale=
+  find_stale() {
+    stale=
+    for f in /proc/[0-9]*/cmdline; do
+      mapfile -d "" -t av < "$f" 2>/dev/null || continue
+      c="${av[*]}"
+      sp=${f//[!0-9]/}
+      [ "$sp" = "$$" ] && continue
+      case $c in
+        "bash "*"steam-wine-daemon") case $c in *" -c "*) ;; *) stale="$stale $sp" ;; esac ;;
+        /nix/store/*/bin/dbus-daemon" --config-file=$STEAM_HOME_DIR/session.conf"*) stale="$stale $sp" ;;
+        /nix/store/*/bin/Xwayland" :$STEAM_DISP "*) stale="$stale $sp" ;;
+        /nix/store/*/bin/$STEAM_WMNAME|/nix/store/*/bin/$STEAM_WMNAME" "*) stale="$stale $sp" ;;
+      esac
+    done
+  }
+  find_stale
+  if [ -n "$stale" ]; then
+    echo "stopping processes of earlier sessions:$stale" >&2
+    "${asu[@]}" kill $stale 2>/dev/null || true
+    # Xwayland takes a few seconds to tear down: wait for them, then kill -9 what is left
+    left=
+    for _ in $(seq 1 50); do
+      left=
+      for sp in $stale; do if [ -d "/proc/$sp" ]; then left="$left $sp"; fi; done
+      if [ -z "$left" ]; then break; fi
+      sleep 0.1
+    done
+    if [ -n "$left" ]; then
+      echo "still running, killing:$left" >&2
+      "${asu[@]}" kill -9 $left 2>/dev/null || true
+      sleep 0.5
+    fi
+  fi
+  # -noreset: without it the X server resets when its last client disconnects, which wipes what the
+  # start-up helpers (xsetroot, xrdb) stored on the root window before Steam even connects
+  # WLSHIM_CURSOR_FRAME: Xwayland waits for a frame callback on its cursor surface before
+  # sending the next cursor image and Exo never sends it, so the shim completes it
+  # WLSHIM_TOUCH_STUBS: Exo sends wl_touch.shape/orientation events Xwayland has no handler for,
+  # which aborts it on the first touch; the shim adds empty handlers
+  xdbg=; if [ -n "$STEAM_XDEBUG" ]; then xdbg=WLSHIM_DEBUG=1; fi
+  # a clean exit of the previous session can leave its Xwayland still shutting down while this one
+  # starts, so if it dies early: clear the lock and socket, wait a moment and try again
+  xtry=0
+  while :; do
+    rm -f "$sock" /tmp/.X$STEAM_DISP-lock
+    "${asu[@]}" env XDG_RUNTIME_DIR="$STEAM_RT" GALLIUM_DRIVER="$STEAM_XGALLIUM" \
+        WLSHIM_CURSOR_FRAME=1 WLSHIM_TOUCH_STUBS=1 $xdbg "${curenv[@]}" \
+        "$xw/bin/Xwayland" ":$STEAM_DISP" -ac -noreset \
+        $xmode $STEAM_XARGS > "$xlog" 2>&1 &
+    xpid=$!
+    xok=
+    for _ in $(seq 1 100); do
+      if [ -S "$sock" ]; then xok=1; break; fi
+      kill -0 "$xpid" 2>/dev/null || break
+      sleep 0.1
+    done
+    [ -n "$xok" ] && break
+    kill "$xpid" 2>/dev/null || true
+    # an Xwayland of an earlier session that is still shutting down holds the display: kill -9 it
+    find_stale
+    if [ -n "$stale" ]; then
+      echo "killing leftover processes:$stale" >&2
+      "${asu[@]}" kill -9 $stale 2>/dev/null || true
+    fi
+    xtry=$((xtry + 1))
+    if [ "$xtry" -ge 8 ]; then
+      echo "Xwayland did not start:" >&2; tail -n 20 "$xlog" >&2; exit 1
+    fi
+    echo "Xwayland exited early, trying again" >&2
+    sleep 1
+  done
+  wmpid=; dbpid=; gpid=; pbpid=
+  # on exit: stop what this script started and wait for Xwayland to be gone (it can take a few
+  # seconds, and a new session starting meanwhile finds its display still taken)
+  cleanup() {
+    kill ${xpid-} ${wmpid-} ${dbpid-} ${gpid-} ${pbpid-} 2>/dev/null || true
+    "${asu[@]}" kill ${xpid-} ${wmpid-} ${dbpid-} ${gpid-} 2>/dev/null || true
+    ci=0
+    while [ -d "/proc/${xpid:-0}" ] && [ "$ci" -lt 100 ]; do sleep 0.1; ci=$((ci + 1)); done
+    rm -f "$sock" /tmp/.X$STEAM_DISP-lock "$STEAM_RT/bus"
+  }
+  trap cleanup EXIT
+
+  # root window colour, so the area around/behind Steam is not default black
+  xr=$(nb xsetroot 2>/dev/null || true)
+  if [ ! -x "$xr/bin/xsetroot" ]; then xr=$(nb xorg.xsetroot 2>/dev/null || true); fi
+  if [ -x "$xr/bin/xsetroot" ]; then
+    "${asu[@]}" env DISPLAY=":$STEAM_DISP" "${curenv[@]}" "$xr/bin/xsetroot" -solid "$STEAM_BGC" -cursor_name left_ptr || true
+  fi
+  # X resources for the cursor: Chromium (the Steam web UI) reads Xcursor.size/theme from the X server
+  # instead of the environment, and otherwise draws its cursors at the default 24 px
+  # (-nocpp: xrdb would run the C preprocessor, which is not installed here)
+  xrd=$(nb xrdb 2>/dev/null || true)
+  if [ ! -x "$xrd/bin/xrdb" ]; then xrd=$(nb xorg.xrdb 2>/dev/null || true); fi
+  if [ -x "$xrd/bin/xrdb" ]; then
+    printf "Xcursor.size: %s\nXcursor.theme: %s\n" "$cursize" "$curtheme" |
+      "${asu[@]}" env DISPLAY=":$STEAM_DISP" "$xrd/bin/xrdb" -nocpp -merge || echo "warning: xrdb failed, Steam keeps its default cursor size" >&2
+  else
+    echo "warning: xrdb not found in nixpkgs, Steam keeps its default cursor size" >&2
+  fi
+
+  if [ -n "$STEAM_WMNAME" ]; then
+    wm=$(nb "$STEAM_WMNAME")
+    wmargs=
+    # openbox: start from its default config and add one rule that maximizes the Steam
+    # main window without a title bar, so Steam fills the Xwayland window and Exo
+    # draws the only window frame. Also no focus on a click inside a window: Openbox then moves
+    # the X input focus and Steam closes its dropdowns and menus before the click is handled
+    rc=$wm/etc/xdg/openbox/rc.xml
+    if [ "$STEAM_WMNAME" = openbox ] && [ -z "$STEAM_NOMAX" ] && [ -f "$rc" ]; then
+      mkdir -p "$STEAM_HOME_DIR/openbox"
+      sed "s#</applications>#  <application class=\"steam\" title=\"Steam\" type=\"normal\"><maximized>yes</maximized><decor>no</decor></application>\n</applications>#" \
+        "$rc" |
+        awk "/<context name=\"Client\">/{c=1} c&&/<action name=\"Focus\"\/>/{next} /<\/context>/{c=0} {print}" \
+        > "$STEAM_HOME_DIR/openbox/rc.xml"
+      if grep -q "<maximized>yes" "$STEAM_HOME_DIR/openbox/rc.xml"; then
+        chmod 644 "$STEAM_HOME_DIR/openbox/rc.xml"
+        wmargs="--config-file $STEAM_HOME_DIR/openbox/rc.xml"
+      else
+        echo "warning: could not add the maximize rule to the openbox config" >&2
+      fi
+    fi
+    "${asu[@]}" env DISPLAY=":$STEAM_DISP" XDG_RUNTIME_DIR="$STEAM_RT" HOME="$STEAM_HOME_DIR" "${curenv[@]}" \
+        "$wm/bin/$STEAM_WMNAME" $wmargs > "$STEAM_HOME_DIR/wm.log" 2>&1 &
+    wmpid=$!
+  fi
+
+  uienv=()
+  if [ -n "$STEAM_HIDPI" ]; then
+    uiscale=${STEAM_UI_SCALE:-$outscale}
+    uienv=(STEAM_FORCE_DESKTOPUI_SCALING="$uiscale")
+    xd=$(nb xdpyinfo 2>/dev/null || true)
+    if [ ! -x "$xd/bin/xdpyinfo" ]; then xd=$(nb xorg.xdpyinfo 2>/dev/null || true); fi
+    if [ -x "$xd/bin/xdpyinfo" ]; then
+      echo "X screen: $("${asu[@]}" env DISPLAY=":$STEAM_DISP" "$xd/bin/xdpyinfo" 2>/dev/null | sed -n "s/^ *dimensions: *//p" | head -n 1) (output scale $outscale, Steam UI scale $uiscale)" >&2
+    fi
+  fi
+
+  # games: start the daemon the proton-cros tool talks to, and make that tool Steam default
+  # (no need to touch the Steam Play settings or the Properties of each game)
+
+  # ALSA (CRAS) settings: Wine runs with HOME=$STEAM_HOME_DIR, so the root .asoundrc has to be there too
+  cp /root/.asoundrc "$STEAM_HOME_DIR/.asoundrc"
+  chown "$STEAM_UIDN:$STEAM_GIDN" "$STEAM_HOME_DIR/.asoundrc"
+  dxvk=$(nb dxvk 2>/dev/null || true)
+  # stand-in DLLs that hand Valve steamclient over to lsteamclient (Steamworks games); the
+  # key changes with the source, and entries of older sources are dropped
+  redir=
+  if [ -r "$STEAM_REDIRECT_SRC/steamclient-redirect.c" ]; then
+    rkey=redirect-$(cat "$STEAM_REDIRECT_SRC/steamclient-redirect.c" "$STEAM_REDIRECT_SRC/default.nix" | cksum | cut -d" " -f1)
+    if rout=$(nbfile "$rkey" "$STEAM_REDIRECT_SRC/default.nix" 2> "$STEAM_HOME_DIR/redirect-build.err"); then
+      redir=$(echo "$rout" | tail -n 1)
+      for f in "$STEAM_CACHE"/redirect-*; do
+        case $f in "$STEAM_CACHE/$rkey"|"$STEAM_CACHE/$rkey.out"|"$STEAM_CACHE/redirect-src") ;; *) rm -f "$f" ;; esac
+      done
+    else
+      echo "warning: could not build the Steamworks redirect DLLs (see $STEAM_HOME_DIR/redirect-build.err); games with Steamworks DRM will not work" >&2
+    fi
+  fi
+  # libraries for games, added to their LD_LIBRARY_PATH: lsteamclient (Proton Steamworks bridge)
+  # needs libstdc++ and the proton runner needs the X11 extension libraries. They come from
+  # nixpkgs; a pair is the current attribute name and the older one
+  plibs=
+  # (the list goes through a variable: quotes inside ${..:-..} would keep it one word)
+  plist=${STEAM_PROTON_LIBS-"libxext|xorg.libXext libxi|xorg.libXi libxrandr|xorg.libXrandr libxfixes|xorg.libXfixes libxcursor|xorg.libXcursor libxrender|xorg.libXrender libxcomposite|xorg.libXcomposite libxinerama|xorg.libXinerama libxkbcommon|libxkbcommon libglvnd|libglvnd stdenv.cc.cc.lib|stdenv.cc.cc.lib"}
+  for pair in $plist; do
+    for a in ${pair//|/ }; do
+      # only download: never compile in /tmp (RAM-backed on ChromeOS)
+      if outs=$(NIXBARGS="--max-jobs 0" nball "$a" 2>/dev/null); then
+        for o in $outs; do
+          if [ -d "$o/lib" ]; then plibs="$plibs:$o/lib"; fi
+        done
+        break
+      fi
+    done
+  done
+  plibs=${plibs#:}
+  if [ -z "$plibs" ]; then echo "warning: could not fetch the libraries Proton games need from nixpkgs (offline?)" >&2; fi
+  # directories given by hand (STEAM_PROTON_EXTRA_LIBDIRS=/nix/store/..-gcc-..-lib/lib:...)
+  if [ -n "${STEAM_PROTON_EXTRA_LIBDIRS-}" ]; then plibs=${plibs:+$plibs:}$STEAM_PROTON_EXTRA_LIBDIRS; fi
+  daemon=$(command -v steam-wine-daemon || true)
+  if [ -n "$daemon" ]; then
+     "${asu[@]}" env XDG_RUNTIME_DIR="$STEAM_RT" HOME="$STEAM_HOME_DIR" "${curenv[@]}" \
+        STEAM_HOST_HOME="$STEAM_HOME_DIR" STEAM_WINE_DXVK="$dxvk" STEAM_GAME_XDISPLAY=":$STEAM_DISP" STEAM_GAME_PROTON_LIBS="$plibs" STEAM_GAME_REDIRECT_DIR="$redir" \
+        bash "$daemon" > "$STEAM_HOME_DIR/wine-daemon.out" 2>&1 &
+    gpid=$!
+  else
+    echo "warning: steam-wine-daemon is not installed in PATH, games cannot start" >&2
+  fi
+  ctool=$STEAM_TOOL_NAME
+  cfg=$STEAM_HOME_DIR/.local/share/Steam/config/config.vdf
+  setc=$(command -v steam-set-compat || true)
+  if [ -n "$ctool" ] && [ -f "$cfg" ] && [ -n "$setc" ]; then
+    py=$(nb python3 2>/dev/null || true)
+    if [ -x "$py/bin/python3" ]; then
+      "$py/bin/python3" "$setc" "$cfg" "$ctool" || echo "warning: could not update $cfg" >&2
+    fi
+  fi
+
+  # srt-bwrap: Steam unpacks its runtimes while it starts (the updater one first, the real one
+  # later) and again after updates, and stops at the first real srt-bwrap it runs. So watch for
+  # them and apply the stub the moment each appears, instead of needing relaunches.
+  if [ -n "$STEAM_PATCH_BWRAP" ]; then
+    (
+      sd=$STEAM_HOME_DIR/.local/share/Steam/ubuntu12_32
+      n=0
+      while :; do
+        need=
+        for f in "$sd/steam-runtime/usr/libexec/steam-runtime-tools-0/srt-bwrap" \
+                 "$sd/steam-runtime.old/usr/libexec/steam-runtime-tools-0/srt-bwrap"; do
+          if [ -e "$f" ] && [ "$(head -c 2 "$f" 2>/dev/null)" != "#!" ]; then need=1; fi
+        done
+        # now and then also look for copies at other places in the runtime
+        n=$((n + 1))
+        if [ -z "$need" ] && [ $((n % 50)) = 0 ] && [ -d "$sd" ]; then
+          while IFS= read -r f; do
+            if [ "$(head -c 2 "$f" 2>/dev/null)" != "#!" ]; then need=1; fi
+          done < <(find "$sd" \( -type f -o -type l \) -name srt-bwrap 2>/dev/null)
+        fi
+        if [ -n "$need" ]; then bash "$STEAM_PATCH_BWRAP" > /dev/null 2>&1 || true; fi
+        sleep 0.2
+      done
+    ) &
+    pbpid=$!
+  fi
+
+  # session bus: Steam runtime services want one, and the sandbox has no dbus-launch
+  bus=$STEAM_RT/bus
+  rm -f "$bus"
+  # our own config: the default session.conf of a nix dbus is not where it looks on ChromeOS
+  buscfg=$STEAM_HOME_DIR/session.conf
+  cat > "$buscfg" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+  "${asu[@]}" env XDG_RUNTIME_DIR="$STEAM_RT" "$dbus/bin/dbus-daemon" --config-file="$buscfg" \
+      --nofork --nopidfile > "$STEAM_HOME_DIR/dbus.log" 2>&1 &
+  dbpid=$!
+  for _ in $(seq 1 50); do [ -S "$bus" ] && break; sleep 0.1; done
+  [ -S "$bus" ] || echo "warning: no D-Bus session bus (see $STEAM_HOME_DIR/dbus.log)" >&2
+
+  # inside the sandbox: no shim (its /lib is the FHS one; Steam speaks X11), the native
+  # iris driver instead of the zink default from wl (the 32-bit client has no 32-bit zink),
+  # and a locale so X input methods can start
+  set +e
+  env -u LD_PRELOAD -u GALLIUM_DRIVER $swgl "${curenv[@]}" "${uienv[@]}" LANG=C.UTF-8 VK_DRIVER_FILES="$vkicd" \
+      LD_LIBRARY_PATH="$ldpath${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+      HOME=/steam-home DISPLAY=":$STEAM_DISP" XDG_RUNTIME_DIR="$STEAM_RT" \
+      FONTCONFIG_FILE=/steam-home/fonts.conf \
+      BWRAP_CROS_BINDS="$STEAM_HOME_DIR:/steam-home,/tmp/.X11-unix:/tmp/.X11-unix" \
+      BWRAP_CROS_UTIL="$util/bin" \
+      BWRAP_CROS_USER="$STEAM_UIDN:$STEAM_GIDN" BWRAP_CROS_GROUPS="$STEAM_SUPP" \
+      $scros "$@"
+  exit $?
+' steam-launch "$@"
