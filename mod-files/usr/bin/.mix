@@ -50,7 +50,7 @@ case "$1" in
     ;;
   list)
     which less &>/dev/null || mix install less &>/dev/null
-    nix-env -q > less
+    nix-env -q | less
     ;;
   revert)
     nix-env --rollback
