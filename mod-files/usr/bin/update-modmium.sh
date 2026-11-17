@@ -19,9 +19,10 @@ repo=$(cat /usr/share/.gitrepo 2>/dev/null)
 if ! which git &>/dev/null || ! which file &>/dev/null; then
   echo -e "${R}Dependencies not installed, installing...${N}"
   source /etc/profile # required to get emerge working in mosh
-  if [[ ! -f ${markdir}/.devinstall_complete ]]; then
+  if [[ ! -f ${markdir}/devinstall_complete ]]; then
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
-    touch ${markdir}/.devinstall_complete
+    mkdir -p ${markdir}
+    touch ${markdir}/devinstall_complete
   fi
   ldconfig # reload shared libraries to include python libs
   emerge git file
@@ -334,7 +335,8 @@ installCros() {
   if [[ ! $REPLY =~ ^[Nn]$ ]]; then
     echo -e "${G}Uninstalling packages...${N}"
     printf 'y\n' | dev_install --uninstall
-    rm -f ${markdir}/.devinstall_complete
+    mkdir -p ${markdir}
+    rm -f ${markdir}/devinstall_complete
   else
     echo -e "${B}Keeping packages installed.${N}"
   fi
@@ -428,7 +430,8 @@ toggleBootPriority(){
   if [[ "$devp" =~ ^[Yy]$ ]]; then
     echo -e "${G}Uninstalling packages...${N}"
     printf 'y\n' | dev_install --uninstall
-    rm -f ${markdir}/.devinstall_complete
+    mkdir -p ${markdir}
+    rm -f ${markdir}/devinstall_complete
   else
     echo -e "${B}Keeping packages installed.${N}"
   fi

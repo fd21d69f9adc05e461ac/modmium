@@ -17,9 +17,10 @@ source /usr/lib/libmosh.sh
 if ! which python3 &>/dev/null; then
   echo -e "${R}Dependencies not installed, installing...${N}"
   source /etc/profile # required to get emerge working in mosh
-  if [[ ! -f ${markdir}/.devinstall_complete ]]; then
+  if [[ ! -f ${markdir}/devinstall_complete ]]; then
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
-    ${markdir}/.devinstall_complete
+    mkdir -p ${markdir}
+    ${markdir}/devinstall_complete
   fi
   ldconfig # reload shared libraries to include python libs
 fi

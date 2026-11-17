@@ -28,6 +28,7 @@ if [[ ! -f $DEVPOL_FILE ]] || [[ ! -d /usr/local/share/policy-test-tool ]]; then
 
   if [[ ! -f $DEVINSTALL_FILE ]]; then
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
+    mkdir -p $markdir
     touch $DEVINSTALL_FILE
   fi
 
@@ -52,6 +53,7 @@ if [[ ! -f $PYTHON_PROTOSKID ]]; then
     touch $PYTHON_PROTOSKID
   else
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
+    mkdir -p $markdir
     touch $DEVINSTALL_FILE
     ldconfig
     emerge cryptography nano pyyaml protobuf-python || fail "${R}emerge failed. Check your internet connection and try again.${N}"

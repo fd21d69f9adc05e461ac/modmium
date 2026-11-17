@@ -46,6 +46,7 @@ install(){
   if [[ ! -f $DEVINSTALL_FILE ]]; then
     echo -e "${G}Installing required dependencies...${N}"
     printf 'y\n\nn' | dev_install --reinstall || fail "${R}Could not install dependencies. Connect to the internet first.${N}"
+    mkdir -p $markdir
     ldconfig
     touch $DEVINSTALL_FILE
   fi
