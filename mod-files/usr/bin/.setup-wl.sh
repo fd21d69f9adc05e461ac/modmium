@@ -77,8 +77,15 @@ steam(){
       exit
   fi
   echo -e "${B}Installing steam, this will take a ${R}LONG TIME and a LOT OF SPACE (around 6GB).${N}"
-  echo -e "${R}You have 3 seconds to cancel (Ctrl+C)...${N}"
-  sleep 3;
+  tput sc
+  timer=5
+  while ((timer>0)); do
+    tput rc
+    tput ed
+    echo -e "${R}You have ${timer} seconds to cancel (Ctrl+C)...${N}"
+    sleep 1
+    ((timer--))
+  done
   echo -e "${Y}Continuing...${N}"
   export NIXPKGS_ALLOW_UNFREE=1
   mix install dejavu_fonts dxvk openbox python3 steam util-linux.bin wayland-utils wineWow64Packages.full xdpyinfo xrdb xsetroot xwayland
